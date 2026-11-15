@@ -5,7 +5,7 @@ mod util;
 
 use adw::prelude::*;
 use pages::Page;
-use std::{cell::RefCell, process::Command, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 const APP_ID: &str = "dev.penguin.MsSuite";
 
@@ -119,27 +119,12 @@ fn build_ui(app: &adw::Application) {
         sign_in.connect_clicked(move |btn| {
             btn.set_sensitive(false);
             let (login, btn, show_app) = (login.clone(), btn.clone(), show_app.clone());
-            util::run(auth::device_start, move |r| match r {
+            login.set_description(Some("Complete sign-in in your browser…"));
+            util::run(auth::browser_login, move |r| match r {
+                Ok(()) => show_app(),
                 Err(e) => {
                     login.set_description(Some(&e));
                     btn.set_sensitive(true);
-                }
-                Ok(dc) => {
-                    login.set_description(Some(&format!(
-                        "Open {} and enter code:\n\n{}",
-                        dc.uri, dc.user_code
-                    )));
-                    let _ = Command::new("xdg-open").arg(&dc.uri).spawn();
-                    util::run(
-                        move || auth::device_poll(&dc),
-                        move |r| match r {
-                            Ok(()) => show_app(),
-                            Err(e) => {
-                                login.set_description(Some(&e));
-                                btn.set_sensitive(true);
-                            }
-                        },
-                    );
                 }
             });
         });

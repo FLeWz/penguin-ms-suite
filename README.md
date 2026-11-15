@@ -11,11 +11,11 @@ Thin sidebar: Outlook, Teams, Calendar, Excel. Data via Microsoft Graph.
 
 ## Azure setup (one time)
 1. Entra ID > App registrations > New registration. Account type as needed.
-2. Authentication > Allow public client flows = Yes.
+2. Authentication > Allow public client flows = Yes; add platform "Mobile and desktop applications" with redirect URI `http://localhost`.
 3. API permissions (delegated, Microsoft Graph): User.Read, Mail.Read,
    Calendars.Read, Chat.ReadWrite, Files.Read. (Admin consent may be needed.)
-4. Provide the Application (client) ID:
-   - env `PENGUIN_MS_CLIENT_ID`, or
+4. Client/tenant IDs are compiled in as defaults (`src/auth.rs`). Override with:
+   - env `PENGUIN_MS_CLIENT_ID` / `PENGUIN_MS_TENANT`, or
    - `~/.config/penguin-ms-suite/config.json`: `{"client_id": "...", "tenant": "common"}`
 
 ## Build / run
@@ -24,7 +24,7 @@ Needs GTK 4.10+ and libadwaita 1.4+ dev packages.
     cargo build --release
     ./target/release/penguin-ms-suite
 
-Sign-in uses the OAuth2 device-code flow. Refresh token is stored with mode 0600
+Sign-in opens the system browser (OAuth2 authorization code + PKCE, loopback redirect). Refresh token is stored with mode 0600
 at `~/.config/penguin-ms-suite/refresh_token`.
 
 ## Performance notes
