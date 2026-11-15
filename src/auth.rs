@@ -9,7 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCOPES: &str = "offline_access User.Read Mail.Read Calendars.Read Chat.ReadWrite Files.Read";
+const DEFAULT_SCOPES: &str =
+    "offline_access User.Read Mail.Read Calendars.Read Chat.ReadWrite Files.Read";
+
+/// Space-separated scopes; override with PENGUIN_MS_SCOPES (tenants may block some).
+fn scopes() -> String {
+    std::env::var("PENGUIN_MS_SCOPES").unwrap_or_else(|_| DEFAULT_SCOPES.into())
+}
 
 // App registration identifiers (not secrets). Env / config.json override.
 const DEFAULT_CLIENT_ID: &str = "00000000-0000-0000-0000-000000000000";
@@ -125,7 +131,7 @@ pub fn browser_login() -> Result<(), String> {
         endpoint(&tenant, "authorize"),
         crate::graph::enc(&id),
         crate::graph::enc(&redirect),
-        crate::graph::enc(SCOPES),
+        crate::graph::enc(&scopes()),
         state,
         challenge
     );
@@ -183,7 +189,7 @@ pub fn browser_login() -> Result<(), String> {
             ("code", code.as_str()),
             ("redirect_uri", redirect.as_str()),
             ("code_verifier", verifier.as_str()),
-            ("scope", SCOPES),
+            ("scope", scopes().as_str()),
         ])
         .map_err(|e| e.to_string())?;
     let v: Value = r.body_mut().read_json().map_err(|e| e.to_string())?;
@@ -231,7 +237,7 @@ pub fn token() -> Result<String, String> {
             ("grant_type", "refresh_token"),
             ("client_id", id.as_str()),
             ("refresh_token", rt.trim()),
-            ("scope", SCOPES),
+            ("scope", scopes().as_str()),
         ])
         .map_err(|e| e.to_string())?;
     let v: Value = r.body_mut().read_json().map_err(|e| e.to_string())?;
