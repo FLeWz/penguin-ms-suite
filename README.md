@@ -14,9 +14,20 @@ Thin sidebar: Outlook, Teams, Calendar, Excel. Data via Microsoft Graph.
 2. Authentication > Allow public client flows = Yes; add platform "Mobile and desktop applications" with redirect URI `http://localhost`.
 3. API permissions (delegated, Microsoft Graph): User.Read, Mail.Read,
    Calendars.Read, Chat.ReadWrite, Files.Read. (Admin consent may be needed.)
-4. Client/tenant IDs are compiled in as defaults (`src/auth.rs`). Override with:
+4. Put the IDs in `.env` (see below). They are compiled into the binary. Runtime override:
    - env `PENGUIN_MS_CLIENT_ID` / `PENGUIN_MS_TENANT`, or
    - `~/.config/penguin-ms-suite/config.json`: `{"client_id": "...", "tenant": "common"}`
+
+## Configuration (.env)
+The Application (client) ID and Directory (tenant) ID are read at build time
+and compiled into the binary; they are not in the source. `.env` is gitignored.
+
+    cp .env.example .env      # then edit the two values
+    cargo build --release
+
+Variables: `PENGUIN_MS_CLIENT_ID`, `PENGUIN_MS_TENANT`. The build fails if they
+are missing. Real environment variables take precedence over `.env`.
+Distribute the built binary, not `.env`.
 
 ## Build / run
 Needs GTK 4.10+ and libadwaita 1.4+ dev packages.

@@ -18,9 +18,9 @@ fn scopes() -> String {
     std::env::var("PENGUIN_MS_SCOPES").unwrap_or_else(|_| DEFAULT_SCOPES.into())
 }
 
-// App registration identifiers (not secrets). Env / config.json override.
-const DEFAULT_CLIENT_ID: &str = "00000000-0000-0000-0000-000000000000";
-const DEFAULT_TENANT: &str = "00000000-0000-0000-0000-000000000000";
+// App registration IDs (not secrets) are injected at build time by build.rs from .env.
+const DEFAULT_CLIENT_ID: &str = env!("BUILTIN_PENGUIN_MS_CLIENT_ID");
+const DEFAULT_TENANT: &str = env!("BUILTIN_PENGUIN_MS_TENANT");
 
 static ACCESS: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
