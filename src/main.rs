@@ -10,11 +10,12 @@ use std::{cell::RefCell, rc::Rc};
 const APP_ID: &str = "dev.penguin.MsSuite";
 
 type Builder = fn() -> Page;
-const APPS: [(&str, &str, Builder); 4] = [
-    ("Outlook", "mail-unread-symbolic", pages::outlook::build),
-    ("Teams", "user-available-symbolic", pages::teams::build),
-    ("Calendar", "x-office-calendar-symbolic", pages::calendar::build),
-    ("Excel", "x-office-spreadsheet-symbolic", pages::excel::build),
+// (name, icon, builder, required Graph permission)
+const APPS: [(&str, &str, Builder, &str); 4] = [
+    ("Outlook", "mail-unread-symbolic", pages::outlook::build, "Mail.Read"),
+    ("Teams", "user-available-symbolic", pages::teams::build, "Chat.ReadWrite"),
+    ("Calendar", "x-office-calendar-symbolic", pages::calendar::build, "Calendars.Read"),
+    ("Excel", "x-office-spreadsheet-symbolic", pages::excel::build, "Files.Read"),
 ];
 
 fn main() -> gtk::glib::ExitCode {
@@ -44,7 +45,11 @@ fn build_ui(app: &adw::Application) {
             match existing {
                 Some(_) => stack.set_visible_child_name(APPS[i].0),
                 None => {
-                    let p = (APPS[i].2)();
+                    let p = if auth::granted(APPS[i].3) {
+                        (APPS[i].2)()
+                    } else {
+                        pages::locked(APPS[i].0, APPS[i].3)
+                    };
                     stack.add_named(&p.widget, Some(APPS[i].0));
                     stack.set_visible_child_name(APPS[i].0);
                     built.borrow_mut()[i] = Some(p.refresh.clone());
@@ -62,7 +67,7 @@ fn build_ui(app: &adw::Application) {
     sidebar.set_margin_end(4);
     let mut first: Option<gtk::ToggleButton> = None;
     let mut buttons = vec![];
-    for (i, (name, icon, _)) in APPS.iter().enumerate() {
+    for (i, (name, icon, _, _)) in APPS.iter().enumerate() {
         let b = gtk::ToggleButton::new();
         b.set_icon_name(icon);
         b.set_tooltip_text(Some(name));
@@ -102,9 +107,20 @@ fn build_ui(app: &adw::Application) {
     root.add_named(&login, Some("login"));
     root.add_named(&app_view, Some("app"));
 
+    let title = adw::WindowTitle::new("Penguin MS Suite", "");
     let show_app = {
-        let (root, buttons, select) = (root.clone(), buttons.clone(), select.clone());
+        let (root, buttons, select, title) =
+            (root.clone(), buttons.clone(), select.clone(), title.clone());
         Rc::new(move || {
+            let title = title.clone();
+            util::run_ok(
+                || graph::get("/me?$select=displayName,userPrincipalName"),
+                move |v| {
+                    let n = v["displayName"].as_str().unwrap_or("");
+                    let m = v["userPrincipalName"].as_str().unwrap_or("");
+                    title.set_subtitle(&format!("{n} · {m}"));
+                },
+            );
             root.set_visible_child_name("app");
             if buttons[0].is_active() {
                 select(0);
@@ -132,6 +148,7 @@ fn build_ui(app: &adw::Application) {
 
     // Header.
     let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&title));
     let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh_btn.set_tooltip_text(Some("Refresh"));
     {

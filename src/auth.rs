@@ -9,8 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DEFAULT_SCOPES: &str =
-    "offline_access User.Read Mail.Read Calendars.Read Chat.ReadWrite Files.Read";
+// Tenant currently allows only basic sign-in without admin consent.
+// After admin approval switch to: "offline_access User.Read Mail.Read Calendars.Read Chat.ReadWrite Files.Read"
+const DEFAULT_SCOPES: &str = "offline_access User.Read";
 
 /// Space-separated scopes; override with PENGUIN_MS_SCOPES (tenants may block some).
 fn scopes() -> String {
@@ -203,6 +204,11 @@ fn store(v: &Value) -> Result<(), String> {
     let at = v["access_token"].as_str().ok_or("no access_token")?;
     let ttl = v["expires_in"].as_u64().unwrap_or(3600).saturating_sub(120);
     *ACCESS.lock().unwrap() = Some((at.into(), Instant::now() + Duration::from_secs(ttl)));
+    if let Some(sc) = v["scope"].as_str() {
+        let d = dir();
+        let _ = fs::create_dir_all(&d);
+        let _ = fs::write(d.join("granted_scopes"), sc);
+    }
     if let Some(rt) = v["refresh_token"].as_str() {
         let d = dir();
         fs::create_dir_all(&d).map_err(|e| e.to_string())?;
@@ -220,6 +226,14 @@ pub fn has_session() -> bool {
 pub fn sign_out() {
     *ACCESS.lock().unwrap() = None;
     let _ = fs::remove_file(dir().join("refresh_token"));
+    let _ = fs::remove_file(dir().join("granted_scopes"));
+}
+
+/// True if the signed-in session was granted `perm` (e.g. "Mail.Read").
+pub fn granted(perm: &str) -> bool {
+    fs::read_to_string(dir().join("granted_scopes"))
+        .map(|s| s.split_whitespace().any(|g| g.eq_ignore_ascii_case(perm) || g.ends_with(&format!("/{perm}"))))
+        .unwrap_or(false)
 }
 
 /// Valid access token; refreshes transparently.
