@@ -5,7 +5,7 @@ Thin sidebar: Outlook, Teams, Calendar, Excel. Data via Microsoft Graph.
 
 ## Features
 - Outlook: inbox (latest 50), read message bodies.
-- Teams: chat list, read messages, send messages.
+- Teams: chat list, read/send messages, emoji picker, photo and video previews (click a photo for full size; videos download to `~/.cache/penguin-ms-suite/media`, pruned after 7 days, and play in-app or in the default player).
 - Calendar: month picker, events for selected day (local time).
 - Excel: .xlsx files from OneDrive, pick sheet, view used range (first 100 rows x 26 cols). Read-only.
 
@@ -59,7 +59,7 @@ Notes:
 - Used by the app today (read-only): Mail.Read, Calendars.Read, Chat.ReadWrite, Files.Read. The rest are registered for upcoming write features.
 
 ## Build / run
-Needs GTK 4.10+ and libadwaita 1.4+ dev packages.
+Needs GTK 4.8+ and libadwaita 1.4+ dev packages.
 
     cargo build --release
     ./target/release/penguin-ms-suite
