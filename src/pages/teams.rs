@@ -469,6 +469,9 @@ pub fn build() -> Page {
     paned.set_end_child(Some(&right));
     paned.set_position(280);
     paned.set_shrink_start_child(false);
+    // Fixed-width list: window resizing changes only the right pane. The divider can still be dragged.
+    paned.set_resize_start_child(false);
+    paned.set_resize_end_child(true);
 
     let ids: Rc<RefCell<Vec<String>>> = Default::default();
     // Suppresses the selection handler while the list is rebuilt programmatically.

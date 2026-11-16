@@ -24,6 +24,9 @@ pub fn build() -> Page {
     paned.set_end_child(Some(&util::pane(&body)));
     paned.set_position(340);
     paned.set_shrink_start_child(false);
+    // Fixed-width list: window resizing changes only the right pane. The divider can still be dragged.
+    paned.set_resize_start_child(false);
+    paned.set_resize_end_child(true);
 
     // Message bodies, index-aligned with list rows.
     let msgs: Rc<std::cell::RefCell<Vec<Value>>> = Default::default();
