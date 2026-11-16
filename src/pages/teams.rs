@@ -286,7 +286,7 @@ pub fn build() -> Page {
              .chat-title { font-size: 0.92em; }
              .chat-preview { font-size: 0.75em; }
              .chat-title-unread { font-weight: 700; }
-             .chat-menu { opacity: 0; margin-right: 2px; }
+             .chat-menu { opacity: 0; margin-right: 14px; } /* clear of the overlay scrollbar */
              .chat-menu button { min-height: 0; min-width: 0; padding: 2px; border-radius: 6px; }
              .chat-menu image { -gtk-icon-size: 12px; }
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
