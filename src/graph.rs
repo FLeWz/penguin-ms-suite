@@ -58,3 +58,51 @@ pub fn enc(s: &str) -> String {
     }
     o
 }
+
+fn bytes_agent(secs: u64) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(secs)))
+        .build()
+        .into()
+}
+
+fn authed_get(path: &str, secs: u64) -> Result<ureq::http::Response<ureq::Body>, String> {
+    let r = bytes_agent(secs)
+        .get(format!("{BASE}{path}"))
+        .header("Authorization", format!("Bearer {}", auth::token()?))
+        .call()
+        .map_err(|e| e.to_string())?;
+    let code = r.status().as_u16();
+    if code >= 400 {
+        return Err(format!("Graph {code}"));
+    }
+    Ok(r)
+}
+
+/// Binary GET (images). Redirects to pre-authenticated download URLs are followed.
+pub fn get_bytes(path: &str, max: u64) -> Result<Vec<u8>, String> {
+    let r = authed_get(path, 60)?;
+    r.into_body()
+        .into_with_config()
+        .limit(max)
+        .read_to_vec()
+        .map_err(|e| e.to_string())
+}
+
+/// Stream a (possibly large) file to `dest` via a .part file; refuses more than `max` bytes.
+pub fn download(path: &str, dest: &std::path::Path, max: u64) -> Result<(), String> {
+    let r = authed_get(path, 1800)?;
+    let part = dest.with_extension("part");
+    let mut f = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+    let mut rd = r.into_body().into_with_config().limit(max).reader();
+    let res = std::io::copy(&mut rd, &mut f).map_err(|e| e.to_string());
+    drop(f);
+    match res {
+        Ok(_) => std::fs::rename(&part, dest).map_err(|e| e.to_string()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}

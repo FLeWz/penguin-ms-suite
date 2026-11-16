@@ -1,4 +1,4 @@
-use super::{finder, Page};
+use super::{finder, media, Page};
 use crate::relay;
 use crate::{graph, util};
 use adw::prelude::*;
@@ -125,7 +125,7 @@ fn is_unread(
 }
 
 /// One chat message as a bubble: mine on the right (accent colour), others on the left.
-fn bubble(who: &str, text: &str, when: &str, mine: bool) -> gtk::Box {
+fn bubble(who: &str, text: &str, when: &str, mine: bool, media: &[gtk::Widget]) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
     b.add_css_class("bubble");
     b.add_css_class(if mine { "bubble-me" } else { "bubble-them" });
@@ -136,13 +136,18 @@ fn bubble(who: &str, text: &str, when: &str, mine: bool) -> gtk::Box {
         n.add_css_class("heading");
         b.append(&n);
     }
-    let t = gtk::Label::new(Some(text));
-    t.set_wrap(true);
-    t.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    t.set_max_width_chars(60);
-    t.set_xalign(0.0);
-    t.set_selectable(true);
-    b.append(&t);
+    for w in media {
+        b.append(w);
+    }
+    if !text.is_empty() {
+        let t = gtk::Label::new(Some(text));
+        t.set_wrap(true);
+        t.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        t.set_max_width_chars(60);
+        t.set_xalign(0.0);
+        t.set_selectable(true);
+        b.append(&t);
+    }
     let w = gtk::Label::new(Some(when));
     w.add_css_class("caption");
     w.add_css_class("dim-label");
@@ -302,6 +307,7 @@ pub fn build() -> Page {
     let list_busy = Rc::new(Cell::new(false));
     let chat_busy = Rc::new(Cell::new(false));
     let me: Rc<RefCell<String>> = Default::default(); // my user id, set by the chat list poll
+    let media = media::Media::new();
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     right.append(&msg_scroll);
@@ -358,6 +364,7 @@ pub fn build() -> Page {
             (live_last.clone(), hold.clone(), shown.clone(), msg_scroll.vadjustment());
         let settling_c = settling.clone();
         let me = me.clone();
+        let media_c = media.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -370,6 +377,7 @@ pub fn build() -> Page {
                 (live_last.clone(), hold.clone(), shown.clone(), adj.clone());
             let settling = settling_c.clone();
             let my_id = me.borrow().clone();
+            let media = media_c.clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -430,13 +438,14 @@ pub fn build() -> Page {
                             m["body"]["content"].as_str().unwrap_or(""),
                             m["body"]["contentType"].as_str().unwrap_or("html"),
                         );
-                        if text.is_empty() {
+                        let media_widgets = media.widgets(&m);
+                        if text.is_empty() && media_widgets.is_empty() {
                             continue;
                         }
                         let mine = !my_id.is_empty()
                             && m["from"]["user"]["id"].as_str() == Some(my_id.as_str());
                         let when = finder::parse_time(m["createdDateTime"].as_str().unwrap_or("")).0;
-                        let r = bubble(who, &text, &when, mine);
+                        let r = bubble(who, &text, &when, mine, &media_widgets);
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }

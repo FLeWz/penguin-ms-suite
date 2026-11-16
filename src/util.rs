@@ -99,6 +99,12 @@ pub fn message_text(body: &str, content_type: &str) -> String {
                 .take_while(|c| c.is_ascii_alphanumeric())
                 .collect::<String>()
                 .to_ascii_lowercase();
+            if name == "emoji" {
+                // Teams emoji are <emoji alt="😀">; keep the character.
+                if let Some(a) = tag.split("alt=\"").nth(1).and_then(|r| r.split('"').next()) {
+                    out.push_str(a);
+                }
+            }
             let breaks = match name.as_str() {
                 "br" => true,
                 "li" => !closing,

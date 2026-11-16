@@ -1,6 +1,7 @@
 pub mod calendar;
 pub mod excel;
 pub mod finder;
+pub mod media;
 pub mod outlook;
 pub mod teams;
 

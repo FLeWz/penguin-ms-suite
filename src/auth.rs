@@ -73,7 +73,7 @@ fn err_of(v: &Value) -> String {
         .to_string()
 }
 
-fn b64url(b: &[u8]) -> String {
+pub fn b64url(b: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut o = String::new();
     for c in b.chunks(3) {
