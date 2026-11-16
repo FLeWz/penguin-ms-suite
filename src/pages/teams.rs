@@ -56,6 +56,9 @@ const POLL_SAFETY_NET: Duration = Duration::from_secs(60); // chat list while th
 struct Prefs {
     fav: HashSet<String>,
     hidden: HashSet<String>,
+    /// Deleted chats -> id of their last message at that time. They stay out of the list until
+    /// a newer message arrives. Kept locally because the chat list API still returns them.
+    deleted: HashMap<String, String>,
 }
 
 impl Prefs {
@@ -74,10 +77,16 @@ impl Prefs {
                 .filter_map(|x| x.as_str().map(String::from))
                 .collect()
         };
-        Prefs { fav: set("favourites"), hidden: set("hidden") }
+        let deleted = v["deleted"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, x)| x.as_str().map(|x| (k.clone(), x.to_string())))
+            .collect();
+        Prefs { fav: set("favourites"), hidden: set("hidden"), deleted }
     }
     fn save(&self) {
-        let v = json!({"favourites": self.fav, "hidden": self.hidden});
+        let v = json!({"favourites": self.fav, "hidden": self.hidden, "deleted": self.deleted});
         let _ = std::fs::create_dir_all(crate::auth::dir());
         let _ = std::fs::write(Self::path(), v.to_string());
     }
@@ -1285,13 +1294,8 @@ pub fn build() -> Page {
     let read_local: Rc<RefCell<HashMap<String, String>>> = Default::default();
     let fresh: Rc<RefCell<HashSet<String>>> = Default::default();
 
-    // Chats deleted this session -> id of their last message then. They stay out of the list
-    // until a newer message arrives (the server brings a hidden chat back the same way).
-    let deleted: Rc<RefCell<HashMap<String, String>>> = Default::default();
-
     let render: Rc<dyn Fn()> = {
         let msgs_r = msgs.clone();
-        let deleted_r = deleted.clone();
         let (chats, ids, current, quiet, cache, prefs, render_cell, show_hidden, titles) = (
             chats.clone(), ids.clone(), current.clone(), quiet.clone(), cache.clone(),
             prefs.clone(), render_cell.clone(), show_hidden.clone(), titles.clone(),
@@ -1302,7 +1306,7 @@ pub fn build() -> Page {
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
             let items: Vec<Value> = {
-                let d = deleted_r.borrow();
+                let d = &prefs.borrow().deleted;
                 items
                     .into_iter()
                     .filter(|c| {
@@ -1418,7 +1422,7 @@ pub fn build() -> Page {
                         let title = chat_title(c, &my_id);
                         let pid = c["lastMessagePreview"]["id"].as_str().unwrap_or("").to_string();
                         let (cid, my, deleted, render_cell, current, msgs_d) =
-                            (cid.clone(), my_id.clone(), deleted_r.clone(), render_cell.clone(), current.clone(), msgs_r.clone());
+                            (cid.clone(), my_id.clone(), prefs.clone(), render_cell.clone(), current.clone(), msgs_r.clone());
                         let line_w = line.downgrade();
                         Rc::new(move || {
                             let parent = line_w.upgrade().and_then(|l| l.root()).and_downcast::<gtk::Window>();
@@ -1450,7 +1454,11 @@ pub fn build() -> Page {
                                     move || graph::post(&format!("/chats/{cid2}/hideForUser"), &body),
                                     move |r| match r {
                                         Ok(_) => {
-                                            deleted.borrow_mut().insert(cid.clone(), pid);
+                                            {
+                                                let mut p = deleted.borrow_mut();
+                                                p.deleted.insert(cid.clone(), pid);
+                                                p.save();
+                                            }
                                             if current.borrow().as_deref() == Some(cid.as_str()) {
                                                 *current.borrow_mut() = None;
                                                 util::clear(&msgs_d);
