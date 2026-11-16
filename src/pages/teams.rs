@@ -224,17 +224,34 @@ pub fn build() -> Page {
                 }
             });
         }
+        // The scroll position is applied from an idle callback, never inside the adjustment's
+        // `changed` signal: that signal fires while the viewport is allocating, so a value set
+        // there updates the adjustment but the viewport keeps drawing the stale offset until
+        // something else triggers a layout (the "latest message hidden until I scroll" bug).
+        let pending = Rc::new(Cell::new(false));
         msg_scroll.vadjustment().connect_changed(move |a| {
-            let target = jump.borrow().clone();
-            if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
-                scroll_to(&msgs, a, &w); // keep it in view while labels settle
-            } else if let Some(v) = hold.get() {
-                a.set_value(v); // keep the reading position across a live reload
-            } else if stick.get() {
-                programmatic.set(true);
-                a.set_value(a.upper() - a.page_size());
-                programmatic.set(false);
+            if pending.replace(true) {
+                return; // one deferred update covers any number of size changes
             }
+            let (a, pending, stick, jump, rows, msgs, hold, programmatic) = (
+                a.clone(), pending.clone(), stick.clone(), jump.clone(), rows.clone(),
+                msgs.clone(), hold.clone(), programmatic.clone(),
+            );
+            gtk::glib::idle_add_local_once(move || {
+                pending.set(false);
+                let target = jump.borrow().clone();
+                if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
+                    scroll_to(&msgs, &a, &w); // keep it in view while labels settle
+                } else if let Some(v) = hold.get() {
+                    programmatic.set(true);
+                    a.set_value(v); // keep the reading position across a live reload
+                    programmatic.set(false);
+                } else if stick.get() {
+                    programmatic.set(true);
+                    a.set_value(a.upper() - a.page_size());
+                    programmatic.set(false);
+                }
+            });
         });
     }
     let apply_jump: Rc<dyn Fn()> = {
@@ -378,7 +395,11 @@ pub fn build() -> Page {
                     util::clear(&msgs);
                     rows.borrow_mut().clear();
                     let mut items = all;
-                    items.reverse(); // API returns newest first
+                    // The API orders by last-modified (edited messages jump ahead), so sort by
+                    // creation time, oldest first, for display.
+                    items.sort_by(|a, b| {
+                        a["createdDateTime"].as_str().unwrap_or("").cmp(b["createdDateTime"].as_str().unwrap_or(""))
+                    });
                     for m in items {
                         let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
                         let text = util::message_text(
