@@ -170,22 +170,6 @@ fn scroll_to(list: &gtk::ListBox, adj: &gtk::Adjustment, w: &gtk::Widget) -> boo
     true
 }
 
-/// Keep the view at the bottom for ~1 s of frames. Wrapped labels and the
-/// final viewport height settle over several layout passes, so a single
-/// set_value() can land short and leave the newest message cut off.
-fn pin_bottom(scroll: &gtk::ScrolledWindow) {
-    let adj = scroll.vadjustment();
-    let start = Instant::now();
-    scroll.add_tick_callback(move |_, _| {
-        adj.set_value(adj.upper() - adj.page_size());
-        if start.elapsed() > Duration::from_millis(1000) {
-            gtk::glib::ControlFlow::Break
-        } else {
-            gtk::glib::ControlFlow::Continue
-        }
-    });
-}
-
 pub fn build() -> Page {
     static CSS: std::sync::Once = std::sync::Once::new();
     CSS.call_once(|| {
@@ -216,9 +200,13 @@ pub fn build() -> Page {
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let msg_scroll = util::pane(&msgs);
-    // While `stick` is set, keep the view pinned to the newest message as
-    // wrapped labels settle their final height.
-    let stick = Rc::new(std::cell::Cell::new(false));
+    // Follow mode: while set, the view stays pinned to the newest message every time the
+    // content or viewport size changes (wrapped labels and the final viewport height settle
+    // over several layout passes, so a timed pin can land short). It turns off when the user
+    // scrolls up and back on when they return to the bottom. `settling` ignores the scroll
+    // changes caused by rebuilding the list.
+    let stick = Rc::new(Cell::new(true));
+    let settling = Rc::new(Cell::new(false));
     // Message id to bring into view after loading (from the finder), and the rows by id.
     let jump: Rc<RefCell<Option<String>>> = Default::default();
     let rows: Rc<RefCell<HashMap<String, gtk::Widget>>> = Default::default();
@@ -227,6 +215,15 @@ pub fn build() -> Page {
     {
         let (stick, jump, rows, msgs, hold) =
             (stick.clone(), jump.clone(), rows.clone(), msgs.clone(), hold.clone());
+        let programmatic = Rc::new(Cell::new(false));
+        {
+            let (stick, settling, programmatic) = (stick.clone(), settling.clone(), programmatic.clone());
+            msg_scroll.vadjustment().connect_value_changed(move |a| {
+                if !programmatic.get() && !settling.get() {
+                    stick.set(a.upper() - a.page_size() - a.value() < 24.0);
+                }
+            });
+        }
         msg_scroll.vadjustment().connect_changed(move |a| {
             let target = jump.borrow().clone();
             if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
@@ -234,7 +231,9 @@ pub fn build() -> Page {
             } else if let Some(v) = hold.get() {
                 a.set_value(v); // keep the reading position across a live reload
             } else if stick.get() {
+                programmatic.set(true);
                 a.set_value(a.upper() - a.page_size());
+                programmatic.set(false);
             }
         });
     }
@@ -316,7 +315,7 @@ pub fn build() -> Page {
         );
         let (live_last, hold, shown, adj) =
             (live_last.clone(), hold.clone(), shown.clone(), msg_scroll.vadjustment());
-        let scroll_w = msg_scroll.clone();
+        let settling_c = settling.clone();
         let me = me.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
@@ -328,7 +327,7 @@ pub fn build() -> Page {
             );
             let (live_last, hold, shown, adj) =
                 (live_last.clone(), hold.clone(), shown.clone(), adj.clone());
-            let scroll_w = scroll_w.clone();
+            let settling = settling_c.clone();
             let my_id = me.borrow().clone();
             let cid = id.clone();
             util::run_ok(
@@ -355,19 +354,21 @@ pub fn build() -> Page {
                     // otherwise keep the reading position.
                     let switched = shown.borrow().as_deref() != Some(cid.as_str());
                     let at_bottom = adj.upper() - adj.page_size() - adj.value() < 40.0;
-                    if jump.borrow().is_none() {
-                        if switched || at_bottom {
-                            pin_bottom(&scroll_w);
-                            stick.set(true);
-                            gtk::glib::timeout_add_local_once(Duration::from_millis(600), move || {
-                                stick.set(false)
-                            });
-                        } else {
-                            hold.set(Some(adj.value()));
-                            gtk::glib::timeout_add_local_once(Duration::from_millis(600), move || {
-                                hold.set(None)
-                            });
-                        }
+                    settling.set(true);
+                    gtk::glib::timeout_add_local_once(Duration::from_millis(600), {
+                        let settling = settling.clone();
+                        move || settling.set(false)
+                    });
+                    if jump.borrow().is_some() {
+                        stick.set(false); // the jump positions the view
+                    } else if switched || stick.get() || at_bottom {
+                        stick.set(true);
+                    } else {
+                        stick.set(false);
+                        hold.set(Some(adj.value()));
+                        gtk::glib::timeout_add_local_once(Duration::from_millis(600), move || {
+                            hold.set(None)
+                        });
                     }
                     *shown.borrow_mut() = Some(cid.clone());
                     if let Some(newest) = all.first().and_then(|m| m["id"].as_str()) {
@@ -415,7 +416,7 @@ pub fn build() -> Page {
         });
     }
     {
-        let (current, load_msgs) = (current.clone(), load_msgs.clone());
+        let (current, load_msgs, stick) = (current.clone(), load_msgs.clone(), stick.clone());
         entry.connect_activate(move |e| {
             let text = e.text().to_string();
             let Some(id) = current.borrow().clone() else { return };
@@ -423,6 +424,7 @@ pub fn build() -> Page {
                 return;
             }
             e.set_text("");
+            stick.set(true); // sending always follows to the newest message
             let load_msgs = load_msgs.clone();
             util::run_ok(
                 move || graph::post(&format!("/me/chats/{id}/messages"), &json!({"body": {"content": text}})),
