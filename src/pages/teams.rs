@@ -498,15 +498,22 @@ pub fn build() -> Page {
     emoji_btn.add_css_class("quiet-icon");
     emoji_btn.set_tooltip_text(Some("Insert emoji"));
     emoji_btn.set_valign(gtk::Align::Center);
-    let chooser = gtk::EmojiChooser::new();
-    emoji_btn.set_popover(Some(&chooser));
+    // The chooser loads the whole emoji set and colour font: build it on first use only.
     {
         let entry = entry.clone();
-        chooser.connect_emoji_picked(move |_, emoji| {
-            let mut pos = entry.position();
-            entry.insert_text(emoji, &mut pos);
-            entry.set_position(pos);
-            entry.grab_focus_without_selecting();
+        emoji_btn.set_create_popup_func(move |btn| {
+            if btn.popover().is_some() {
+                return;
+            }
+            let chooser = gtk::EmojiChooser::new();
+            let entry = entry.clone();
+            chooser.connect_emoji_picked(move |_, emoji| {
+                let mut pos = entry.position();
+                entry.insert_text(emoji, &mut pos);
+                entry.set_position(pos);
+                entry.grab_focus_without_selecting();
+            });
+            btn.set_popover(Some(&chooser));
         });
     }
     let compose = gtk::Box::new(gtk::Orientation::Horizontal, 0);
