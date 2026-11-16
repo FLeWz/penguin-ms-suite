@@ -52,7 +52,19 @@ pub fn build() -> Page {
     entry.set_margin_end(6);
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    right.append(&util::pane(&msgs));
+    let msg_scroll = util::pane(&msgs);
+    // While `stick` is set, keep the view pinned to the newest message as
+    // wrapped labels settle their final height.
+    let stick = Rc::new(std::cell::Cell::new(false));
+    {
+        let stick = stick.clone();
+        msg_scroll.vadjustment().connect_changed(move |a| {
+            if stick.get() {
+                a.set_value(a.upper() - a.page_size());
+            }
+        });
+    }
+    right.append(&msg_scroll);
     right.append(&entry);
     right.set_hexpand(true);
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -67,13 +79,17 @@ pub fn build() -> Page {
     let current: Rc<RefCell<Option<String>>> = Default::default();
 
     let load_msgs = {
-        let (msgs, current) = (msgs.clone(), current.clone());
+        let (msgs, current, stick) = (msgs.clone(), current.clone(), stick.clone());
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
-            let msgs = msgs.clone();
+            let (msgs, stick) = (msgs.clone(), stick.clone());
             util::run_ok(
                 move || graph::get(&format!("/me/chats/{id}/messages?$top=40")),
                 move |v| {
+                    stick.set(true);
+                    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+                        stick.set(false)
+                    });
                     util::clear(&msgs);
                     let mut items = v["value"].as_array().cloned().unwrap_or_default();
                     items.reverse(); // API returns newest first
