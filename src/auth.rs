@@ -9,9 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Tenant currently allows only basic sign-in without admin consent.
-// After admin approval switch to: "offline_access User.Read Mail.Read Calendars.Read Chat.ReadWrite Files.Read"
-const DEFAULT_SCOPES: &str = "offline_access User.Read";
+// All delegated permissions registered and admin-approved for the tenant.
+// ChannelMessage.Read.All is left out: it was not granted at last check, and
+// requesting an ungranted scope blocks the whole sign-in. Add it via PENGUIN_MS_SCOPES.
+const DEFAULT_SCOPES: &str = "offline_access User.Read User.ReadBasic.All \
+    Mail.Read Mail.ReadWrite Mail.ReadWrite.Shared Mail.Send MailboxSettings.ReadWrite \
+    Calendars.Read Calendars.ReadWrite Calendars.ReadWrite.Shared OnlineMeetings.ReadWrite \
+    Chat.ReadWrite Team.ReadBasic.All Channel.ReadBasic.All ChannelMessage.Send Presence.ReadWrite \
+    Files.Read Files.ReadWrite Files.ReadWrite.All Sites.ReadWrite.All Contacts.ReadWrite";
 
 /// Space-separated scopes; override with PENGUIN_MS_SCOPES (tenants may block some).
 fn scopes() -> String {

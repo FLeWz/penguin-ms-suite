@@ -54,7 +54,7 @@ Added to the app registration. "Admin consent required" is as shown in the Entra
 Notes:
 - `ChannelMessage.Read.All` is the only permission flagged as needing admin consent, and it is not granted. Do not request it until an admin approves it.
 - The portal says "No" for the others, but in practice the tenant still showed "Need admin approval" when sign-in requested the first five (User.Read, Mail.Read, Calendars.Read, Chat.ReadWrite, Files.Read). Only `User.Read` signed in without admin approval, so the tenant's user-consent policy appears stricter than the column suggests.
-- The app requests only what it uses, set in `DEFAULT_SCOPES` in `src/auth.rs` (currently `offline_access User.Read`). Override at runtime with `PENGUIN_MS_SCOPES`.
+- The app requests only what it uses, set in `DEFAULT_SCOPES` in `src/auth.rs` (currently every permission above except `ChannelMessage.Read.All`). Override at runtime with `PENGUIN_MS_SCOPES`.
 - After scopes change, sign out and sign in again: the saved session keeps the old scopes.
 - Used by the app today (read-only): Mail.Read, Calendars.Read, Chat.ReadWrite, Files.Read. The rest are registered for upcoming write features.
 
