@@ -330,6 +330,20 @@ fn bubble(
     outer
 }
 
+/// Older history of the open chat, fetched page by page as the user scrolls up. The newest
+/// page is re-fetched by every live reload; these older pages are kept and merged in.
+#[derive(Default)]
+struct Older {
+    chat: String,
+    msgs: Vec<Value>,
+    /// Graph `@odata.nextLink` for the next older page; None = start of the chat reached.
+    next: Option<String>,
+    loading: bool,
+}
+
+/// Stop paging back after this many older messages (keeps memory and widget count bounded).
+const MAX_OLDER: usize = 1500;
+
 /// Whole-message selection: Shift+click extends a range of messages, Ctrl+C copies them as
 /// text, Esc or a plain click clears it. (Labels cannot select text across several messages.)
 #[derive(Default)]
@@ -530,15 +544,29 @@ pub fn build() -> Page {
     let msg_sel: Rc<RefCell<MsgSel>> = Default::default();
     // Scroll position held across a live reload when the user is reading history.
     let hold: Rc<Cell<Option<f64>>> = Default::default();
+    let older: Rc<RefCell<Older>> = Default::default();
+    // (upper, value) before older messages were added above: keeps the reading position.
+    let prepend: Rc<Cell<Option<(f64, f64)>>> = Default::default();
+    // Loads the next older page; filled in once `load_msgs` exists.
+    let more_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
     {
         let (stick, jump, rows, msgs, hold) =
             (stick.clone(), jump.clone(), rows.clone(), msgs.clone(), hold.clone());
+        let prepend_c = prepend.clone();
         let programmatic = Rc::new(Cell::new(false));
         {
             let (stick, settling, programmatic) = (stick.clone(), settling.clone(), programmatic.clone());
+            let more_cell = more_cell.clone();
             msg_scroll.vadjustment().connect_value_changed(move |a| {
                 if !programmatic.get() && !settling.get() {
                     stick.set(a.upper() - a.page_size() - a.value() < 24.0);
+                    // Near the top while reading history: fetch the next older page.
+                    if !stick.get() && a.value() < 300.0 {
+                        let f = more_cell.borrow().clone();
+                        if let Some(f) = f {
+                            f();
+                        }
+                    }
                 }
             });
         }
@@ -555,11 +583,16 @@ pub fn build() -> Page {
                 a.clone(), pending.clone(), stick.clone(), jump.clone(), rows.clone(),
                 msgs.clone(), hold.clone(), programmatic.clone(),
             );
+            let prepend = prepend_c.clone();
             gtk::glib::idle_add_local_once(move || {
                 pending.set(false);
                 let target = jump.borrow().clone();
                 if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
                     scroll_to(&msgs, &a, &w); // keep it in view while labels settle
+                } else if let Some((upper, value)) = prepend.get() {
+                    programmatic.set(true);
+                    a.set_value(a.upper() - upper + value); // same messages stay under the eyes
+                    programmatic.set(false);
                 } else if let Some(v) = hold.get() {
                     programmatic.set(true);
                     a.set_value(v); // keep the reading position across a live reload
@@ -727,6 +760,7 @@ pub fn build() -> Page {
         let links_c = link_previews.clone();
         let one_c = one_on_one.clone();
         let sel_c = msg_sel.clone();
+        let (older_c, prepend_c, more_c) = (older.clone(), prepend.clone(), more_cell.clone());
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -743,24 +777,27 @@ pub fn build() -> Page {
             let link_previews = links_c.clone();
             let is_one = one_c.borrow().contains(&id);
             let sel = sel_c.clone();
+            let (older, prepend, more_cell) = (older_c.clone(), prepend_c.clone(), more_c.clone());
             let cid = id.clone();
             util::run_ok(
                 move || {
                     // One page normally; when jumping to an older message, page back until found.
                     let mut path = format!("/me/chats/{id}/messages?$top=50");
                     let mut all: Vec<Value> = vec![];
+                    let mut last_next: Option<String> = None;
                     for _ in 0..6 {
                         let v = graph::get(&path)?;
                         all.extend(v["value"].as_array().cloned().unwrap_or_default());
+                        last_next = v["@odata.nextLink"].as_str().map(String::from);
                         let found = want.as_ref().is_none_or(|w| all.iter().any(|m| m["id"].as_str() == Some(w)));
-                        match v["@odata.nextLink"].as_str() {
+                        match &last_next {
                             Some(u) if !found => path = u.strip_prefix(graph::BASE).unwrap_or(u).to_string(),
                             _ => break,
                         }
                     }
-                    Ok(all)
+                    Ok((all, last_next))
                 },
-                move |all| {
+                move |(all, last_next)| {
                     if current.borrow().as_deref() != Some(cid.as_str()) {
                         return; // user switched chats meanwhile
                     }
@@ -773,7 +810,25 @@ pub fn build() -> Page {
                         let settling = settling.clone();
                         move || settling.set(false)
                     });
-                    if jump.borrow().is_some() {
+                    // Older pages: a new chat (or a jump that paged back itself) starts over from
+                    // this response; otherwise keep what was already fetched.
+                    {
+                        let mut o = older.borrow_mut();
+                        if o.chat != cid || all.len() > 50 {
+                            *o = Older { chat: cid.clone(), msgs: vec![], next: last_next, loading: false };
+                            prepend.set(None);
+                        }
+                    }
+                    let prepended = prepend.get().is_some();
+                    if prepended {
+                        gtk::glib::timeout_add_local_once(Duration::from_millis(800), {
+                            let prepend = prepend.clone();
+                            move || prepend.set(None)
+                        });
+                    }
+                    if prepended {
+                        stick.set(false); // reading older history; position restored by the handler
+                    } else if jump.borrow().is_some() {
                         stick.set(false); // the jump positions the view
                     } else if switched || stick.get() || at_bottom {
                         stick.set(true);
@@ -788,11 +843,35 @@ pub fn build() -> Page {
                     if let Some(newest) = all.first().and_then(|m| m["id"].as_str()) {
                         live_last.borrow_mut().insert(cid.clone(), newest.to_string());
                     }
-                    finder::add(&index, finder::parse(&cid, &title, &all));
+                    let mut items = all;
+                    {
+                        let have: HashSet<String> =
+                            items.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
+                        let o = older.borrow();
+                        items.extend(
+                            o.msgs.iter().filter(|m| m["id"].as_str().is_none_or(|i| !have.contains(i))).cloned(),
+                        );
+                    }
+                    finder::add(&index, finder::parse(&cid, &title, &items));
                     util::clear(&msgs);
                     rows.borrow_mut().clear();
                     sel.borrow_mut().reset();
-                    let mut items = all;
+                    if older.borrow().next.is_some() && older.borrow().msgs.len() < MAX_OLDER {
+                        // Also reachable without scrolling (short chats, or no scrollbar).
+                        let more = gtk::Button::with_label("Load older messages");
+                        more.add_css_class("flat");
+                        more.set_margin_top(6);
+                        more.set_margin_bottom(6);
+                        more.set_halign(gtk::Align::Center);
+                        let more_cell = more_cell.clone();
+                        more.connect_clicked(move |_| {
+                            let f = more_cell.borrow().clone();
+                            if let Some(f) = f {
+                                f();
+                            }
+                        });
+                        msgs.append(&more);
+                    }
                     // The API orders by last-modified (edited messages jump ahead), so sort by
                     // creation time, oldest first, for display.
                     items.sort_by(|a, b| {
@@ -829,6 +908,54 @@ pub fn build() -> Page {
             );
         })
     };
+
+    // Next older page (50 messages) of the open chat; called near the top of the list.
+    {
+        let (older, current, load_msgs, prepend, adj) =
+            (older.clone(), current.clone(), load_msgs.clone(), prepend.clone(), msg_scroll.vadjustment());
+        *more_cell.borrow_mut() = Some(Rc::new(move || {
+            let Some(cid) = current.borrow().clone() else { return };
+            let next = {
+                let mut o = older.borrow_mut();
+                if o.chat != cid || o.loading || o.msgs.len() >= MAX_OLDER {
+                    return;
+                }
+                let Some(n) = o.next.clone() else { return };
+                o.loading = true;
+                n
+            };
+            let path = next.strip_prefix(graph::BASE).unwrap_or(&next).to_string();
+            let (older, load_msgs, prepend, adj) = (older.clone(), load_msgs.clone(), prepend.clone(), adj.clone());
+            util::run(
+                move || graph::get(&path),
+                move |r| {
+                    let mut o = older.borrow_mut();
+                    o.loading = false;
+                    if o.chat != cid {
+                        return;
+                    }
+                    match r {
+                        Ok(v) => {
+                            let page = v["value"].as_array().cloned().unwrap_or_default();
+                            let have: HashSet<String> =
+                                o.msgs.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
+                            o.msgs.extend(
+                                page.into_iter().filter(|m| m["id"].as_str().is_none_or(|i| !have.contains(i))),
+                            );
+                            o.next = v["@odata.nextLink"].as_str().map(String::from);
+                            drop(o);
+                            prepend.set(Some((adj.upper(), adj.value())));
+                            load_msgs();
+                        }
+                        Err(e) => {
+                            drop(o);
+                            util::toast(&format!("Could not load older messages: {e}"));
+                        }
+                    }
+                },
+            );
+        }));
+    }
     {
         let (ids, current, load_msgs, quiet) =
             (ids.clone(), current.clone(), load_msgs.clone(), quiet.clone());
