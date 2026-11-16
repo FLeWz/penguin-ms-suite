@@ -196,26 +196,11 @@ fn bubble(
     b.add_css_class("bubble");
     b.add_css_class(if mine { "bubble-me" } else { "bubble-them" });
     b.set_halign(if mine { gtk::Align::End } else { gtk::Align::Start });
-    let time_label = || {
-        let w = gtk::Label::new(Some(when));
-        w.add_css_class("caption");
-        w.add_css_class("dim-label");
-        w.add_css_class("bubble-time");
-        w.set_xalign(1.0);
-        w
-    };
     if !mine {
-        // Name on the left, date on the right of the same line.
-        let head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let n = gtk::Label::new(Some(who));
         n.set_xalign(0.0);
-        n.set_hexpand(true);
         n.add_css_class("heading");
-        head.append(&n);
-        let w = time_label();
-        w.set_valign(gtk::Align::Center);
-        head.append(&w);
-        b.append(&head);
+        b.append(&n);
     }
     for w in media {
         b.append(w);
@@ -233,9 +218,12 @@ fn bubble(
     for w in link_cards {
         b.append(w);
     }
-    if mine {
-        b.append(&time_label()); // own bubbles have no name line, keep the date at the bottom
-    }
+    let w = gtk::Label::new(Some(when));
+    w.add_css_class("caption");
+    w.add_css_class("dim-label");
+    w.add_css_class("bubble-time");
+    w.set_xalign(1.0);
+    b.append(&w);
 
     let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     outer.set_margin_top(3);
