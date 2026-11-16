@@ -22,6 +22,19 @@ fn ui_path() -> std::path::PathBuf {
     crate::auth::dir().join("ui.json")
 }
 
+/// Saved UI setting from `ui.json` (window and pane sizes).
+pub fn ui_get(key: &str) -> Option<serde_json::Value> {
+    ui_load().get(key).cloned()
+}
+
+/// Update one setting in `ui.json`, keeping the others.
+pub fn ui_set(key: &str, val: serde_json::Value) {
+    let mut v = ui_load();
+    v[key] = val;
+    let _ = std::fs::create_dir_all(crate::auth::dir());
+    let _ = std::fs::write(ui_path(), v.to_string());
+}
+
 fn ui_load() -> serde_json::Value {
     std::fs::read_to_string(ui_path())
         .ok()
@@ -43,10 +56,7 @@ pub fn remember_paned(paned: &gtk::Paned, key: &'static str, default: i32) {
             if epoch.get() != g || !(180..=700).contains(&w) {
                 return; // dragged again since, or an implausible value during startup layout
             }
-            let mut v = ui_load();
-            v[key] = serde_json::json!(w);
-            let _ = std::fs::create_dir_all(crate::auth::dir());
-            let _ = std::fs::write(ui_path(), v.to_string());
+            ui_set(key, serde_json::json!(w));
         });
     });
 }

@@ -123,6 +123,55 @@ fn install_palettes() {
     sm.connect_dark_notify(sync);
 }
 
+fn saved_size(key: &str, default: i32) -> i32 {
+    util::ui_get(key)
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .filter(|v| (400..=10000).contains(v))
+        .unwrap_or(default)
+}
+
+/// Save the window size and maximized state (size only while not maximized or fullscreen),
+/// shortly after changes and on close.
+fn remember_window(win: &adw::ApplicationWindow) {
+    let save = {
+        let win = win.clone();
+        move || {
+            let maximized = win.is_maximized();
+            util::ui_set("window_maximized", serde_json::json!(maximized));
+            if !maximized && !win.is_fullscreen() && win.width() >= 400 && win.height() >= 400 {
+                util::ui_set("window_width", serde_json::json!(win.width()));
+                util::ui_set("window_height", serde_json::json!(win.height()));
+            }
+        }
+    };
+    let epoch = Rc::new(std::cell::Cell::new(0u32));
+    let schedule = {
+        let (save, epoch) = (save.clone(), epoch.clone());
+        move || {
+            epoch.set(epoch.get() + 1);
+            let (g, epoch, save) = (epoch.get(), epoch.clone(), save.clone());
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+                if epoch.get() == g {
+                    save();
+                }
+            });
+        }
+    };
+    {
+        let s = schedule.clone();
+        win.connect_default_width_notify(move |_| s());
+        let s = schedule.clone();
+        win.connect_default_height_notify(move |_| s());
+        let s = schedule.clone();
+        win.connect_maximized_notify(move |_| s());
+    }
+    win.connect_close_request(move |_| {
+        save();
+        gtk::glib::Propagation::Proceed
+    });
+}
+
 fn main() -> gtk::glib::ExitCode {
     // Cairo renderer: ~3x lower RSS than GL/Vulkan for this list/text UI.
     // Respect an explicit user choice.
@@ -314,10 +363,14 @@ fn build_ui(app: &adw::Application) {
     let win = adw::ApplicationWindow::builder()
         .application(app)
         .title("Penguin MS Suite")
-        .default_width(1100)
-        .default_height(720)
+        .default_width(saved_size("window_width", 1100))
+        .default_height(saved_size("window_height", 720))
         .content(&toasts)
         .build();
+    if util::ui_get("window_maximized").and_then(|v| v.as_bool()) == Some(true) {
+        win.maximize();
+    }
+    remember_window(&win);
     win.present();
     // Target of notification clicks.
     let raise = gtk::gio::SimpleAction::new("raise", None);
