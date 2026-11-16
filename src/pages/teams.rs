@@ -35,9 +35,9 @@ fn header(text: &str) -> gtk::ListBoxRow {
     l.set_xalign(0.0);
     l.add_css_class("caption-heading");
     l.add_css_class("dim-label");
-    l.set_margin_top(10);
-    l.set_margin_bottom(4);
-    l.set_margin_start(10);
+    l.set_margin_top(6);
+    l.set_margin_bottom(1);
+    l.set_margin_start(8);
     let r = gtk::ListBoxRow::new();
     r.set_child(Some(&l));
     r.set_selectable(false);
@@ -88,13 +88,58 @@ impl Prefs {
     }
 }
 
-fn icon_button(icon: &str, tip: &str) -> gtk::Button {
-    let b = gtk::Button::from_icon_name(icon);
-    b.add_css_class("flat");
-    b.add_css_class("circular");
-    b.set_valign(gtk::Align::Center);
-    b.set_tooltip_text(Some(tip));
+/// Compact two-line chat entry: title, then a one-line preview.
+fn chat_info(title: &str, preview: &str, unread: bool) -> gtk::Box {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    b.set_margin_top(3);
+    b.set_margin_bottom(3);
+    b.set_margin_start(6);
+    b.set_margin_end(4);
+    for (i, (text, classes)) in [(title, "chat-title"), (preview, "caption dim-label")].into_iter().enumerate() {
+        let l = gtk::Label::new(Some(text));
+        l.set_xalign(0.0);
+        l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        l.set_single_line_mode(true);
+        for c in classes.split(' ') {
+            l.add_css_class(c);
+        }
+        if unread && i == 0 {
+            l.add_css_class("chat-title-unread");
+        }
+        b.append(&l);
+    }
     b
+}
+
+/// "⋮" menu with the favourite and hide actions. The same popover opens on right click.
+fn chat_menu(is_fav: bool, is_hidden: bool, on_fav: impl Fn() + 'static, on_hide: impl Fn() + 'static) -> gtk::MenuButton {
+    let mb = gtk::MenuButton::new();
+    mb.set_icon_name("view-more-symbolic");
+    for c in ["flat", "circular", "chat-menu", "quiet-icon"] {
+        mb.add_css_class(c);
+    }
+    mb.set_valign(gtk::Align::Center);
+    mb.set_tooltip_text(Some("Chat actions"));
+    let pop = gtk::Popover::new();
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let item = |label: &str, cb: Box<dyn Fn()>| {
+        let b = gtk::Button::with_label(label);
+        b.add_css_class("flat");
+        if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+            l.set_xalign(0.0);
+        }
+        let pop = pop.clone();
+        b.connect_clicked(move |_| {
+            pop.popdown();
+            cb();
+        });
+        b
+    };
+    col.append(&item(if is_fav { "Remove from favourites" } else { "Add to favourites" }, Box::new(on_fav)));
+    col.append(&item(if is_hidden { "Unhide chat" } else { "Hide chat" }, Box::new(on_hide)));
+    pop.set_child(Some(&col));
+    mb.set_popover(Some(&pop));
+    mb
 }
 
 /// Unread = the last message is from someone else, is newer than the read marker
@@ -226,6 +271,11 @@ pub fn build() -> Page {
              .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
              .bubble-them { background: alpha(currentColor, 0.09); }
              .msg-scroll { transition: opacity 150ms ease-in; }
+             .chat-list row { min-height: 0; padding: 0 2px; }
+             .chat-title { font-size: 0.95em; }
+             .chat-title-unread { font-weight: 700; }
+             .chat-menu { opacity: 0; min-height: 0; min-width: 0; padding: 3px; margin-right: 2px; }
+             .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
              .thumb { transition: opacity 250ms ease-in; }
              .thumb-placeholder { background: alpha(currentColor, 0.07); border-radius: 8px; }
              .attach-chip { background: alpha(currentColor, 0.09); border-radius: 8px; padding: 2px 4px 2px 8px; }
@@ -241,6 +291,7 @@ pub fn build() -> Page {
     });
     let chats = gtk::ListBox::new();
     chats.add_css_class("navigation-sidebar");
+    chats.add_css_class("chat-list");
     let msgs = gtk::ListBox::new();
     msgs.set_selection_mode(gtk::SelectionMode::None);
     msgs.add_css_class("message-list");
@@ -762,24 +813,16 @@ pub fn build() -> Page {
                         dot.set_tooltip_text(Some("Unread"));
                     }
                     line.append(&dot);
-                    let info = util::row(&chat_title(c, &my_id), &prev);
+                    let info = chat_info(&chat_title(c, &my_id), &prev, unread);
                     info.set_hexpand(true);
                     line.append(&info);
 
-                    let fav_btn = icon_button(
-                        if is_fav { "starred-symbolic" } else { "non-starred-symbolic" },
-                        if is_fav { "Remove from favourites" } else { "Add to favourites" },
-                    );
-                    let hide_btn = icon_button(
-                        if is_hidden { "view-reveal-symbolic" } else { "view-conceal-symbolic" },
-                        if is_hidden { "Unhide chat" } else { "Hide chat" },
-                    );
-                    for (btn, is_fav_btn) in [(&fav_btn, true), (&hide_btn, false)] {
+                    let toggle = {
                         let (prefs, render_cell, cid) = (prefs.clone(), render_cell.clone(), cid.clone());
-                        btn.connect_clicked(move |_| {
+                        Rc::new(move |fav: bool| {
                             {
                                 let mut p = prefs.borrow_mut();
-                                if is_fav_btn {
+                                if fav {
                                     Prefs::toggle(&mut p.fav, &cid);
                                 } else {
                                     Prefs::toggle(&mut p.hidden, &cid);
@@ -788,12 +831,24 @@ pub fn build() -> Page {
                             }
                             let r = render_cell.borrow().clone();
                             if let Some(r) = r {
-                                // Defer: we are inside a widget that render() destroys.
+                                // Defer: the menu lives in a row that render() destroys.
                                 gtk::glib::idle_add_local_once(move || r());
                             }
-                        });
-                        line.append(btn);
-                    }
+                        })
+                    };
+                    let (t1, t2) = (toggle.clone(), toggle);
+                    let menu = chat_menu(is_fav, is_hidden, move || t1(true), move || t2(false));
+                    line.append(&menu);
+                    // Right click anywhere on the entry opens the same menu.
+                    let rc = gtk::GestureClick::new();
+                    rc.set_button(3);
+                    let menu_w = menu.downgrade();
+                    rc.connect_pressed(move |_, _, _, _| {
+                        if let Some(m) = menu_w.upgrade() {
+                            m.popup();
+                        }
+                    });
+                    line.add_controller(rc);
                     chats.append(&line);
                     order.push(cid);
                 }
