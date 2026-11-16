@@ -378,7 +378,57 @@ pub fn build() -> Page {
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     // chat id -> member user ids other than me (recipients when sharing uploaded files)
     let chat_members: Rc<RefCell<HashMap<String, Vec<String>>>> = Default::default();
-    right.append(&msg_scroll);
+    // "Jump to newest" button, shown while scrolled up. Animates to the bottom and turns
+    // follow mode back on.
+    let jump_btn = gtk::Button::from_icon_name("go-down-symbolic");
+    jump_btn.add_css_class("circular");
+    jump_btn.add_css_class("osd");
+    jump_btn.set_tooltip_text(Some("Scroll to newest message"));
+    let jump_rev = gtk::Revealer::new();
+    jump_rev.set_child(Some(&jump_btn));
+    jump_rev.set_transition_type(gtk::RevealerTransitionType::Crossfade);
+    jump_rev.set_transition_duration(150);
+    jump_rev.set_halign(gtk::Align::End);
+    jump_rev.set_valign(gtk::Align::End);
+    jump_rev.set_margin_end(16);
+    jump_rev.set_margin_bottom(12);
+    {
+        let adj = msg_scroll.vadjustment();
+        let rev = jump_rev.clone();
+        let update = move |a: &gtk::Adjustment| {
+            rev.set_reveal_child(a.upper() - a.page_size() - a.value() > 200.0);
+        };
+        adj.connect_value_changed(update.clone());
+        adj.connect_changed(update);
+    }
+    {
+        let (adj, scroll, stick) = (msg_scroll.vadjustment(), msg_scroll.clone(), stick.clone());
+        jump_btn.connect_clicked(move |_| {
+            let target = adw::CallbackAnimationTarget::new({
+                let adj = adj.clone();
+                move |v| adj.set_value(v)
+            });
+            let anim = adw::TimedAnimation::new(
+                &scroll,
+                adj.value(),
+                adj.upper() - adj.page_size(),
+                250,
+                target,
+            );
+            anim.set_easing(adw::Easing::EaseOutCubic);
+            let (adj, stick) = (adj.clone(), stick.clone());
+            anim.connect_done(move |_| {
+                adj.set_value(adj.upper() - adj.page_size()); // content may have grown meanwhile
+                stick.set(true);
+            });
+            anim.play();
+        });
+    }
+    let msg_overlay = gtk::Overlay::new();
+    msg_overlay.set_child(Some(&msg_scroll));
+    msg_overlay.add_overlay(&jump_rev);
+    msg_overlay.set_vexpand(true);
+    right.append(&msg_overlay);
     right.append(&tray.widget);
     right.append(&compose);
     attach::install_drop(&right, &tray);
