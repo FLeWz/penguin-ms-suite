@@ -42,6 +42,8 @@ struct Item {
     /// Hosted-content URL (graph.microsoft.com) or SharePoint/OneDrive link.
     url: String,
     shared_file: bool,
+    /// Pixel size from the message HTML (`width`/`height`), to reserve space before loading.
+    dims: Option<(f64, f64)>,
 }
 
 impl Item {
@@ -64,6 +66,32 @@ impl Item {
             .collect();
         cache_dir().join(format!("{}_{}", self.key(), safe))
     }
+}
+
+/// Number after `name` in an HTML tag: `width="320"` or `style="width: 320px"`.
+fn tag_dim(tag: &str, name: &str) -> Option<f64> {
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        let prev_ok = at == 0 || !(tag.as_bytes()[at - 1].is_ascii_alphanumeric() || tag.as_bytes()[at - 1] == b'-');
+        if !prev_ok {
+            continue;
+        }
+        let rest = tag[at + name.len()..].trim_start();
+        let rest = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':'))?.trim_start().trim_start_matches('"');
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        if let Ok(v) = num.parse::<f64>() {
+            if v > 0.0 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn tag_dims(tag: &str) -> Option<(f64, f64)> {
+    Some((tag_dim(tag, "width")?, tag_dim(tag, "height")?))
 }
 
 fn hex(b: &[u8]) -> String {
@@ -107,7 +135,7 @@ fn items(m: &Value) -> Vec<Item> {
         let tag = part.split('>').next().unwrap_or("");
         let Some(src) = tag.split("src=\"").nth(1).and_then(|r| r.split('"').next()) else { continue };
         if src.starts_with(graph::BASE) && src.contains("/hostedContents/") {
-            out.push(Item { kind: Kind::Image, name: "image.png".into(), url: src.to_string(), shared_file: false });
+            out.push(Item { kind: Kind::Image, name: "image.png".into(), url: src.to_string(), shared_file: false, dims: tag_dims(tag) });
         }
     }
     // Files shared as references (OneDrive / SharePoint).
@@ -123,7 +151,7 @@ fn items(m: &Value) -> Vec<Item> {
         } else {
             continue;
         };
-        out.push(Item { kind, name: name.to_string(), url: url.to_string(), shared_file: true });
+        out.push(Item { kind, name: name.to_string(), url: url.to_string(), shared_file: true, dims: None });
     }
     out
 }
@@ -132,15 +160,41 @@ fn open_external(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
+/// Decoded textures are immutable and GDK documents them as usable from any thread; this
+/// only lets a finished decode travel back from the worker thread.
+struct SendTexture(gdk::Texture);
+// SAFETY: GdkTexture is immutable and thread-safe; it is only used on the main thread afterwards.
+unsafe impl Send for SendTexture {}
+
+const MAX_PARALLEL: usize = 3; // image downloads at once
+const LOAD_MARGIN: f32 = 300.0; // px beyond the viewport that still count as "near"
+const PLACEHOLDER: (f64, f64) = (240.0, 160.0); // used when the size is unknown
+
 pub struct Media {
     textures: RefCell<HashMap<String, gdk::Texture>>,
     inflight: RefCell<HashSet<String>>,
+    /// Images waiting to be loaded (lazy): key -> item, and the holders showing it.
+    wanted: RefCell<HashMap<String, Item>>,
+    waiting: RefCell<HashMap<String, Vec<glib::WeakRef<gtk::Box>>>>,
+    loading: RefCell<HashSet<String>>,
+    failed: RefCell<HashMap<String, String>>,
+    scroll: RefCell<Option<gtk::ScrolledWindow>>,
+    kick_queued: std::cell::Cell<bool>,
 }
 
 impl Media {
     pub fn new() -> Rc<Self> {
         prune_cache();
-        Rc::new(Media { textures: Default::default(), inflight: Default::default() })
+        Rc::new(Media {
+            textures: Default::default(),
+            inflight: Default::default(),
+            wanted: Default::default(),
+            waiting: Default::default(),
+            loading: Default::default(),
+            failed: Default::default(),
+            scroll: Default::default(),
+            kick_queued: Default::default(),
+        })
     }
 
     /// Preview widgets for the message's photos and videos (empty if none).
@@ -155,51 +209,141 @@ impl Media {
             .collect()
     }
 
+    /// Lazy loading: images are fetched only when near the viewport, nearest first, a few at
+    /// a time. Call once with the message list's scroll window.
+    pub fn attach_viewport(self: &Rc<Self>, scroll: &gtk::ScrolledWindow) {
+        *self.scroll.borrow_mut() = Some(scroll.clone());
+        let adj = scroll.vadjustment();
+        let me = self.clone();
+        adj.connect_value_changed(move |_| me.schedule_kick());
+        let me = self.clone();
+        adj.connect_changed(move |_| me.schedule_kick()); // layout settled or size changed
+    }
+
+    fn schedule_kick(self: &Rc<Self>) {
+        if self.kick_queued.replace(true) {
+            return;
+        }
+        let me = self.clone();
+        glib::idle_add_local_once(move || {
+            me.kick_queued.set(false);
+            me.kick();
+        });
+    }
+
+    /// Start loading the waiting images closest to the viewport.
+    fn kick(self: &Rc<Self>) {
+        let Some(scroll) = self.scroll.borrow().clone() else { return };
+        let view_h = scroll.height() as f32;
+        let mut near: Vec<(f32, String)> = vec![];
+        {
+            let mut waiting = self.waiting.borrow_mut();
+            waiting.retain(|_, hs| {
+                hs.retain(|h| h.upgrade().is_some_and(|b| b.parent().is_some()));
+                !hs.is_empty()
+            });
+            for (key, hs) in waiting.iter() {
+                if self.loading.borrow().contains(key) {
+                    continue;
+                }
+                let dist = hs
+                    .iter()
+                    .filter_map(|h| h.upgrade())
+                    .filter_map(|b| b.compute_bounds(&scroll))
+                    .map(|r| {
+                        if r.y() + r.height() < 0.0 {
+                            -(r.y() + r.height())
+                        } else if r.y() > view_h {
+                            r.y() - view_h
+                        } else {
+                            0.0 // on screen
+                        }
+                    })
+                    .fold(f32::MAX, f32::min);
+                if dist <= LOAD_MARGIN {
+                    near.push((dist, key.clone()));
+                }
+            }
+        }
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, key) in near {
+            if self.loading.borrow().len() >= MAX_PARALLEL {
+                break;
+            }
+            self.start_load(&key);
+        }
+    }
+
+    fn start_load(self: &Rc<Self>, key: &str) {
+        let Some(it) = self.wanted.borrow().get(key).cloned() else { return };
+        self.loading.borrow_mut().insert(key.to_string());
+        // Show a spinner on the placeholders now that loading has begun.
+        for h in self.waiting.borrow().get(key).into_iter().flatten().filter_map(|h| h.upgrade()) {
+            let spin = gtk::Spinner::new();
+            spin.start();
+            spin.set_halign(gtk::Align::Center);
+            spin.set_valign(gtk::Align::Center);
+            spin.set_hexpand(true);
+            spin.set_vexpand(true);
+            spin.set_size_request(24, 24);
+            h.append(&spin);
+        }
+        let (me, key, path, name) = (self.clone(), key.to_string(), it.api_path(), it.name.clone());
+        util::run(
+            // Fetch and decode off the UI thread so big photos do not stall scrolling.
+            move || {
+                let bytes = graph::get_bytes(&path, MAX_IMAGE_BYTES)?;
+                gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                    .map(SendTexture)
+                    .map_err(|e| e.to_string())
+            },
+            move |r| {
+                me.loading.borrow_mut().remove(&key);
+                me.wanted.borrow_mut().remove(&key);
+                let holders = me.waiting.borrow_mut().remove(&key).unwrap_or_default();
+                match r {
+                    Ok(SendTexture(t)) => {
+                        let mut c = me.textures.borrow_mut();
+                        if c.len() >= MAX_TEXTURES {
+                            c.clear();
+                        }
+                        c.insert(key.clone(), t.clone());
+                        drop(c);
+                        for h in holders.iter().filter_map(|h| h.upgrade()) {
+                            show_image(&h, &t, &name, true);
+                        }
+                    }
+                    Err(e) => {
+                        for h in holders.iter().filter_map(|h| h.upgrade()) {
+                            show_error(&h, &e);
+                        }
+                        me.failed.borrow_mut().insert(key, e);
+                    }
+                }
+                me.schedule_kick(); // next in line
+            },
+        );
+    }
+
     fn image_widget(self: &Rc<Self>, it: Item) -> gtk::Widget {
         let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         holder.set_halign(gtk::Align::Start);
         let key = it.key();
         if let Some(t) = self.textures.borrow().get(&key).cloned() {
-            show_image(&holder, &t, &it.name);
+            show_image(&holder, &t, &it.name, false);
             return holder.upcast();
         }
-        let spin = gtk::Spinner::new();
-        spin.start();
-        spin.set_size_request(THUMB_W as i32, 120);
-        holder.append(&spin);
-        if self.inflight.borrow_mut().insert(key.clone()) {
-            let (me, weak, path, name) = (self.clone(), holder.downgrade(), it.api_path(), it.name.clone());
-            util::run(
-                move || graph::get_bytes(&path, MAX_IMAGE_BYTES),
-                move |r| {
-                    me.inflight.borrow_mut().remove(&key);
-                    let tex = r.and_then(|b| {
-                        gdk::Texture::from_bytes(&glib::Bytes::from_owned(b)).map_err(|e| e.to_string())
-                    });
-                    match tex {
-                        Ok(t) => {
-                            let mut c = me.textures.borrow_mut();
-                            if c.len() >= MAX_TEXTURES {
-                                c.clear();
-                            }
-                            c.insert(key, t.clone());
-                            if let Some(h) = weak.upgrade() {
-                                show_image(&h, &t, &name);
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(h) = weak.upgrade() {
-                                clear(&h);
-                                let l = gtk::Label::new(Some(&format!("Image unavailable ({e})")));
-                                l.add_css_class("dim-label");
-                                l.add_css_class("caption");
-                                h.append(&l);
-                            }
-                        }
-                    }
-                },
-            );
+        if let Some(e) = self.failed.borrow().get(&key) {
+            show_error(&holder, e);
+            return holder.upcast();
         }
+        // Reserve the final space now so nothing shifts when the image arrives.
+        let (w, h) = fit(it.dims.unwrap_or(PLACEHOLDER));
+        holder.set_size_request(w, h);
+        holder.add_css_class("thumb-placeholder");
+        self.waiting.borrow_mut().entry(key.clone()).or_default().push(holder.downgrade());
+        self.wanted.borrow_mut().entry(key).or_insert(it);
+        self.schedule_kick();
         holder.upcast()
     }
 
@@ -276,17 +420,41 @@ fn clear(b: &gtk::Box) {
     }
 }
 
-/// Scaled thumbnail in the bubble; click opens the full-size viewer.
-fn show_image(holder: &gtk::Box, tex: &gdk::Texture, name: &str) {
-    clear(holder);
-    let (w, h) = (tex.width() as f64, tex.height() as f64);
+/// Thumbnail size for an image of `dims` pixels: fits the thumbnail box, never upscaled.
+fn fit(dims: (f64, f64)) -> (i32, i32) {
+    let (w, h) = dims;
     let s = (THUMB_W / w).min(THUMB_H / h).min(1.0);
+    ((w * s).max(1.0) as i32, (h * s).max(1.0) as i32)
+}
+
+fn show_error(holder: &gtk::Box, e: &str) {
+    clear(holder);
+    holder.set_size_request(-1, -1);
+    holder.remove_css_class("thumb-placeholder");
+    let l = gtk::Label::new(Some(&format!("Image unavailable ({e})")));
+    l.add_css_class("dim-label");
+    l.add_css_class("caption");
+    holder.append(&l);
+}
+
+/// Scaled thumbnail in the bubble; click opens the full-size viewer. `fade`: fade it in.
+fn show_image(holder: &gtk::Box, tex: &gdk::Texture, name: &str, fade: bool) {
+    clear(holder);
+    holder.remove_css_class("thumb-placeholder");
+    let (pw, ph) = fit((tex.width() as f64, tex.height() as f64));
+    holder.set_size_request(pw, ph);
     let pic = gtk::Picture::for_paintable(tex);
     pic.set_content_fit(gtk::ContentFit::Contain);
     pic.set_can_shrink(true);
-    pic.set_size_request((w * s).max(1.0) as i32, (h * s).max(1.0) as i32);
+    pic.set_size_request(pw, ph);
     pic.set_cursor_from_name(Some("pointer"));
     pic.set_tooltip_text(Some(name));
+    pic.add_css_class("thumb");
+    if fade {
+        pic.set_opacity(0.0);
+        let p = pic.clone();
+        glib::idle_add_local_once(move || p.set_opacity(1.0));
+    }
     let click = gtk::GestureClick::new();
     let (tex, name) = (tex.clone(), name.to_string());
     let holder_w = holder.downgrade();

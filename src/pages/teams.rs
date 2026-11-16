@@ -195,6 +195,8 @@ pub fn build() -> Page {
              .bubble { border-radius: 14px; padding: 6px 10px; }
              .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
              .bubble-them { background: alpha(currentColor, 0.09); }
+             .thumb { transition: opacity 250ms ease-in; }
+             .thumb-placeholder { background: alpha(currentColor, 0.07); border-radius: 8px; }
              .attach-chip { background: alpha(currentColor, 0.09); border-radius: 8px; padding: 2px 4px 2px 8px; }
              .drop-active { background: alpha(@accent_bg_color, 0.18); }
              .link-card { background: alpha(currentColor, 0.08); border-left: 3px solid @accent_color; border-radius: 8px; padding: 6px 10px; margin-top: 4px; }
@@ -335,6 +337,7 @@ pub fn build() -> Page {
     let chat_busy = Rc::new(Cell::new(false));
     let me: Rc<RefCell<String>> = Default::default(); // my user id, set by the chat list poll
     let media = media::Media::new();
+    media.attach_viewport(&msg_scroll);
     let link_previews = links::Links::new();
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
