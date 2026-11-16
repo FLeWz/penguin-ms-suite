@@ -256,7 +256,6 @@ pub fn build() -> Page {
              .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
              .bubble-them { background: alpha(currentColor, 0.09); }
              .chat-list row { min-height: 0; padding: 0 2px; margin: 2px 4px; border-radius: 6px; }
-             .chat-title { font-size: 0.92em; }
              .chat-preview { font-size: 0.75em; }
              .chat-title-unread { font-weight: 700; }
              .chat-menu { opacity: 0; margin-right: 14px; } /* clear of the overlay scrollbar */
