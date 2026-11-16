@@ -2,7 +2,7 @@ use super::Page;
 use crate::{graph, util};
 use adw::prelude::*;
 use serde_json::{json, Value};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 fn chat_title(c: &Value, me: &str) -> String {
     if let Some(t) = c["topic"].as_str().filter(|t| !t.is_empty()) {
@@ -76,6 +76,8 @@ pub fn build() -> Page {
     paned.set_shrink_start_child(false);
 
     let ids: Rc<RefCell<Vec<String>>> = Default::default();
+    // Suppresses the selection handler while the list is rebuilt programmatically.
+    let quiet = Rc::new(std::cell::Cell::new(false));
     let current: Rc<RefCell<Option<String>>> = Default::default();
 
     let load_msgs = {
@@ -115,9 +117,13 @@ pub fn build() -> Page {
     };
 
     {
-        let (ids, current, load_msgs) = (ids.clone(), current.clone(), load_msgs.clone());
+        let (ids, current, load_msgs, quiet) =
+            (ids.clone(), current.clone(), load_msgs.clone(), quiet.clone());
         chats.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
+            if quiet.get() {
+                return;
+            }
             let id = ids.borrow().get(row.index() as usize).cloned().filter(|i| !i.is_empty());
             if id.is_none() {
                 return;
@@ -143,40 +149,143 @@ pub fn build() -> Page {
         });
     }
 
-    let refresh: Rc<dyn Fn()> = Rc::new(move || {
-        let (chats, ids) = (chats.clone(), ids.clone());
-        util::run_ok(
-            || {
-                let me = graph::get("/me?$select=id")?["id"].as_str().unwrap_or("").to_string();
-                let v = graph::get("/me/chats?$expand=members&$top=50&$orderby=lastMessagePreview/createdDateTime%20desc")?;
-                Ok((me, v))
-            },
-            move |(me, v)| {
-                util::clear(&chats);
-                let items = v["value"].as_array().cloned().unwrap_or_default();
-                let mut order: Vec<String> = vec![];
-                // People = 1:1 chats. Groups = group chats and meeting chats.
-                for (label, people) in [("PEOPLE", true), ("GROUPS", false)] {
-                    let sel: Vec<&Value> = items
-                        .iter()
-                        .filter(|c| (c["chatType"].as_str() == Some("oneOnOne")) == people)
-                        .collect();
-                    if sel.is_empty() {
-                        continue;
-                    }
-                    chats.append(&header(label));
-                    order.push(String::new());
-                    for c in sel {
-                        let prev = util::strip_html(
-                            c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""),
-                        );
-                        chats.append(&util::row(&chat_title(c, &me), &prev));
-                        order.push(c["id"].as_str().unwrap_or("").to_string());
-                    }
-                }
-                *ids.borrow_mut() = order;
-            },
+    // Latest message id seen per chat, to detect new arrivals. Empty until first load.
+    let seen: Rc<RefCell<HashMap<String, String>>> = Default::default();
+    let me: Rc<RefCell<String>> = Default::default();
+    let signature: Rc<RefCell<String>> = Default::default();
+
+    let do_refresh: Rc<dyn Fn(bool)> = {
+        let (chats, ids, current, load_msgs, quiet, seen, me, signature) = (
+            chats.clone(), ids.clone(), current.clone(), load_msgs.clone(),
+            quiet.clone(), seen.clone(), me.clone(), signature.clone(),
         );
-    });
+        Rc::new(move |polling: bool| {
+            let (chats, ids, current, load_msgs, quiet, seen, me2, signature) = (
+                chats.clone(), ids.clone(), current.clone(), load_msgs.clone(),
+                quiet.clone(), seen.clone(), me.clone(), signature.clone(),
+            );
+            let known_me = me.borrow().clone();
+            util::run(
+                move || {
+                    let me = if known_me.is_empty() {
+                        graph::get("/me?$select=id")?["id"].as_str().unwrap_or("").to_string()
+                    } else {
+                        known_me
+                    };
+                    let v = graph::get("/me/chats?$expand=members&$top=50&$orderby=lastMessagePreview/createdDateTime%20desc")?;
+                    Ok::<_, String>((me, v))
+                },
+                move |r| {
+                    let (my_id, v) = match r {
+                        Ok(x) => x,
+                        Err(e) => {
+                            if !polling {
+                                util::toast(&e); // polling stays silent
+                            }
+                            return;
+                        }
+                    };
+                    *me2.borrow_mut() = my_id.clone();
+                    let items = v["value"].as_array().cloned().unwrap_or_default();
+
+                    // New-message detection.
+                    let first_load = seen.borrow().is_empty();
+                    let mut new_in_current = false;
+                    for c in &items {
+                        let cid = c["id"].as_str().unwrap_or("");
+                        let mid = c["lastMessagePreview"]["id"].as_str().unwrap_or("");
+                        if mid.is_empty() {
+                            continue;
+                        }
+                        let changed = seen.borrow().get(cid).map(|o| o != mid).unwrap_or(!first_load);
+                        seen.borrow_mut().insert(cid.to_string(), mid.to_string());
+                        if !changed {
+                            continue;
+                        }
+                        let from = &c["lastMessagePreview"]["from"]["user"];
+                        if from["id"].as_str() == Some(my_id.as_str()) {
+                            continue; // my own message
+                        }
+                        let is_current = current.borrow().as_deref() == Some(cid);
+                        new_in_current |= is_current;
+                        let focused = chats
+                            .root()
+                            .and_downcast::<gtk::Window>()
+                            .map(|w| w.is_active())
+                            .unwrap_or(false);
+                        if !(is_current && focused) {
+                            let n = gtk::gio::Notification::new(&chat_title(c, &my_id));
+                            let who = from["displayName"].as_str().unwrap_or("");
+                            let text = util::strip_html(
+                                c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""),
+                            );
+                            n.set_body(Some(&if who.is_empty() { text } else { format!("{who}: {text}") }));
+                            n.set_default_action("app.raise");
+                            if let Some(app) = gtk::gio::Application::default() {
+                                app.send_notification(Some(&format!("chat-{cid}")), &n);
+                            }
+                        }
+                    }
+
+                    // Rebuild the list only when something visible changed.
+                    let sig: String = items
+                        .iter()
+                        .map(|c| format!("{}|{}", c["id"], c["lastMessagePreview"]["id"]))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    if *signature.borrow() != sig {
+                        *signature.borrow_mut() = sig;
+                        quiet.set(true);
+                        util::clear(&chats);
+                        let mut order: Vec<String> = vec![];
+                        // People = 1:1 chats. Groups = group chats and meeting chats.
+                        for (label, people) in [("PEOPLE", true), ("GROUPS", false)] {
+                            let sel: Vec<&Value> = items
+                                .iter()
+                                .filter(|c| (c["chatType"].as_str() == Some("oneOnOne")) == people)
+                                .collect();
+                            if sel.is_empty() {
+                                continue;
+                            }
+                            chats.append(&header(label));
+                            order.push(String::new());
+                            for c in sel {
+                                let prev = util::strip_html(
+                                    c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""),
+                                );
+                                chats.append(&util::row(&chat_title(c, &my_id), &prev));
+                                order.push(c["id"].as_str().unwrap_or("").to_string());
+                            }
+                        }
+                        // Keep the open chat selected.
+                        let cur = current.borrow().clone();
+                        if let Some(i) = cur.and_then(|c| order.iter().position(|o| *o == c)) {
+                            chats.select_row(chats.row_at_index(i as i32).as_ref());
+                        }
+                        *ids.borrow_mut() = order;
+                        quiet.set(false);
+                    }
+                    if new_in_current {
+                        load_msgs();
+                    }
+                },
+            );
+        })
+    };
+
+    // Live updates: poll every 10 s while the page exists.
+    {
+        let do_refresh = do_refresh.clone();
+        let weak = paned.downgrade();
+        gtk::glib::timeout_add_seconds_local(10, move || {
+            if weak.upgrade().and_then(|p| p.parent()).is_none() || !crate::auth::has_session() {
+                return gtk::glib::ControlFlow::Break; // page removed or signed out
+            }
+            do_refresh(true);
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+
+    let refresh: Rc<dyn Fn()> = Rc::new(move || do_refresh(false));
     Page { widget: paned.upcast(), refresh }
 }

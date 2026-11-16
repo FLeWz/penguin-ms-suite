@@ -196,6 +196,13 @@ fn build_ui(app: &adw::Application) {
         .content(&toasts)
         .build();
     win.present();
+    // Target of notification clicks.
+    let raise = gtk::gio::SimpleAction::new("raise", None);
+    {
+        let win = win.clone();
+        raise.connect_activate(move |_, _| win.present());
+    }
+    app.add_action(&raise);
 
     if auth::has_session() {
         show_app();
