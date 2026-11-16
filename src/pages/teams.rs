@@ -518,7 +518,7 @@ pub fn build() -> Page {
     left.set_size_request(260, -1);
     paned.set_start_child(Some(&left));
     paned.set_end_child(Some(&right));
-    paned.set_position(280);
+    util::remember_paned(&paned, "teams_list_width", 280);
     paned.set_shrink_start_child(false);
     // Fixed-width list: window resizing changes only the right pane. The divider can still be dragged.
     paned.set_resize_start_child(false);

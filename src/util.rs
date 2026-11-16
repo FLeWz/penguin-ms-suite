@@ -18,6 +18,39 @@ pub fn toast(msg: &str) {
     });
 }
 
+fn ui_path() -> std::path::PathBuf {
+    crate::auth::dir().join("ui.json")
+}
+
+fn ui_load() -> serde_json::Value {
+    std::fs::read_to_string(ui_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Pane width in `ui.json`, restored on the next start. The pane position is set to the saved
+/// value (or `default`) now and saved 400 ms after the user stops dragging the divider.
+pub fn remember_paned(paned: &gtk::Paned, key: &'static str, default: i32) {
+    let saved = ui_load()[key].as_i64().map(|v| v as i32).filter(|v| (180..=700).contains(v));
+    paned.set_position(saved.unwrap_or(default));
+    let epoch = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    paned.connect_position_notify(move |p| {
+        epoch.set(epoch.get() + 1);
+        let (g, epoch, p) = (epoch.get(), epoch.clone(), p.clone());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+            let w = p.position();
+            if epoch.get() != g || !(180..=700).contains(&w) {
+                return; // dragged again since, or an implausible value during startup layout
+            }
+            let mut v = ui_load();
+            v[key] = serde_json::json!(w);
+            let _ = std::fs::create_dir_all(crate::auth::dir());
+            let _ = std::fs::write(ui_path(), v.to_string());
+        });
+    });
+}
+
 /// Run blocking `work` on a thread; deliver result on the GTK main loop.
 pub fn run<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,

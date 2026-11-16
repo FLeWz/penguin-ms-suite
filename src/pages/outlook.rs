@@ -22,7 +22,7 @@ pub fn build() -> Page {
     left.set_size_request(320, -1);
     paned.set_start_child(Some(&left));
     paned.set_end_child(Some(&util::pane(&body)));
-    paned.set_position(340);
+    util::remember_paned(&paned, "outlook_list_width", 340);
     paned.set_shrink_start_child(false);
     // Fixed-width list: window resizing changes only the right pane. The divider can still be dragged.
     paned.set_resize_start_child(false);
