@@ -498,6 +498,8 @@ pub fn build() -> Page {
              .chat-menu button { min-height: 0; min-width: 0; padding: 2px; border-radius: 6px; }
              .chat-menu image { -gtk-icon-size: 12px; }
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
+             .finder-scrim { background: alpha(black, 0.45); }
+             .finder-card { background: @popover_bg_color; color: @popover_fg_color; border: 1px solid alpha(currentColor, 0.18); border-radius: 12px; box-shadow: 0 10px 32px alpha(black, 0.5); }
              .msg-selected { background: alpha(@accent_bg_color, 0.25); border-radius: 8px; }
              .lightbox { background: alpha(black, 0.85); }
              .thumb { transition: opacity 250ms ease-in; }
@@ -901,7 +903,7 @@ pub fn build() -> Page {
                     let mut path = format!("/me/chats/{id}/messages?$top=50");
                     let mut all: Vec<Value> = vec![];
                     let mut last_next: Option<String> = None;
-                    for _ in 0..6 {
+                    for _ in 0..40 {
                         let v = graph::get(&path)?;
                         all.extend(v["value"].as_array().cloned().unwrap_or_default());
                         last_next = v["@odata.nextLink"].as_str().map(String::from);

@@ -269,14 +269,31 @@ fn move_selection(list: &gtk::ListBox, scroll: &gtk::ScrolledWindow, delta: i32)
 }
 
 pub fn build(h: Hooks) -> Finder {
-    let panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    panel.add_css_class("card");
-    panel.add_css_class("background");
-    panel.set_width_request(640);
-    panel.set_halign(gtk::Align::Center);
-    panel.set_valign(gtk::Align::Start);
-    panel.set_margin_top(30);
+    // `panel` is the dimmed full-window layer (click it to close); `card` is the solid box in it.
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    panel.add_css_class("finder-scrim");
     panel.set_visible(false);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("finder-card");
+    card.set_width_request(640);
+    card.set_halign(gtk::Align::Center);
+    card.set_valign(gtk::Align::Start);
+    card.set_margin_top(30);
+    panel.append(&card);
+    {
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        let (panel_c, card_c) = (panel.clone(), card.clone());
+        click.connect_released(move |_, _, x, y| {
+            let inside = card_c
+                .compute_bounds(&panel_c)
+                .is_some_and(|r| r.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)));
+            if !inside {
+                panel_c.set_visible(false);
+            }
+        });
+        panel.add_controller(click);
+    }
 
     let scope_chat = gtk::ToggleButton::with_label("This chat");
     let scope_all = gtk::ToggleButton::with_label("All chats");
@@ -309,9 +326,9 @@ pub fn build(h: Hooks) -> Finder {
         .propagate_natural_height(true)
         .build();
     scroll.set_margin_bottom(8);
-    panel.append(&top);
-    panel.append(&entry);
-    panel.append(&scroll);
+    card.append(&top);
+    card.append(&entry);
+    card.append(&scroll);
 
     let hits: Rc<RefCell<Vec<Msg>>> = Default::default();
     let note: Rc<RefCell<String>> = Default::default(); // indexing progress text
@@ -392,56 +409,103 @@ pub fn build(h: Hooks) -> Finder {
         })
     };
 
-    // Fetch recent messages of every chat (4 worker threads) into the index.
+    // Index job: pages back through the given chats (4 worker threads) into the index,
+    // adding each page as it arrives. `pages` is the most 50-message pages fetched per chat.
     let fetched: Rc<RefCell<HashMap<String, Instant>>> = Default::default();
-    let ensure_all: Rc<dyn Fn()> = {
-        let (index, chats, run, note, fetched, panel) =
-            (h.index.clone(), h.chats.clone(), run.clone(), note.clone(), fetched.clone(), panel.clone());
-        Rc::new(move || {
-            let targets: Vec<(String, String)> = chats()
-                .into_iter()
-                .filter(|(id, _)| fetched.borrow().get(id).is_none_or(|t| t.elapsed() > REINDEX_AFTER))
-                .collect();
+    let deep: Rc<RefCell<HashMap<String, Instant>>> = Default::default();
+    let index_job: Rc<dyn Fn(Vec<(String, String)>, usize, Rc<RefCell<HashMap<String, Instant>>>, bool)> = {
+        let (index, run, note, panel) = (h.index.clone(), run.clone(), note.clone(), panel.clone());
+        Rc::new(move |targets, pages, done_map, quiet_count| {
             if targets.is_empty() {
                 return;
             }
             for (id, _) in &targets {
-                fetched.borrow_mut().insert(id.clone(), Instant::now());
+                done_map.borrow_mut().insert(id.clone(), Instant::now());
             }
             let total = targets.len();
-            let (tx, rx) = async_channel::unbounded::<(String, Result<Vec<Msg>, String>)>();
+            // (chat, a page of messages or an error, last page for this chat)
+            let (tx, rx) = async_channel::unbounded::<(String, Result<Vec<Msg>, String>, bool)>();
             for t in 0..4 {
                 let tx = tx.clone();
                 let mine: Vec<(String, String)> = targets.iter().skip(t).step_by(4).cloned().collect();
                 std::thread::spawn(move || {
                     for (id, title) in mine {
-                        let r = graph::get(&format!("/me/chats/{id}/messages?$top=50")).map(|v| {
-                            parse(&id, &title, v["value"].as_array().map_or(&[][..], |a| a.as_slice()))
-                        });
-                        let _ = tx.send_blocking((id, r));
+                        let mut path = format!("/me/chats/{id}/messages?$top=50");
+                        for n in 0..pages {
+                            match graph::get(&path) {
+                                Ok(v) => {
+                                    let msgs = parse(&id, &title, v["value"].as_array().map_or(&[][..], |a| a.as_slice()));
+                                    let next = v["@odata.nextLink"].as_str().map(|u| u.strip_prefix(graph::BASE).unwrap_or(u).to_string());
+                                    let last = n + 1 == pages || next.is_none();
+                                    let _ = tx.send_blocking((id.clone(), Ok(msgs), last));
+                                    match next {
+                                        Some(p) => path = p,
+                                        None => break,
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send_blocking((id.clone(), Err(e), true));
+                                    break;
+                                }
+                            }
+                        }
                     }
                 });
             }
             drop(tx);
-            *note.borrow_mut() = format!("indexing 0/{total}");
-            let (index, run, note, fetched, panel) =
-                (index.clone(), run.clone(), note.clone(), fetched.clone(), panel.clone());
+            *note.borrow_mut() = if quiet_count { "loading history…".into() } else { format!("indexing 0/{total}") };
+            let (index, run, note, done_map, panel) =
+                (index.clone(), run.clone(), note.clone(), done_map.clone(), panel.clone());
             glib::spawn_future_local(async move {
-                let mut done = 0;
-                while let Ok((id, r)) = rx.recv().await {
-                    done += 1;
+                let (mut done, mut count) = (0, 0usize);
+                while let Ok((id, r, last)) = rx.recv().await {
                     match r {
-                        Ok(m) => add(&index, m),
+                        Ok(m) => {
+                            count += m.len();
+                            add(&index, m);
+                        }
                         Err(_) => {
-                            fetched.borrow_mut().remove(&id); // retry next time
+                            done_map.borrow_mut().remove(&id); // retry next time
                         }
                     }
-                    *note.borrow_mut() = if done == total { String::new() } else { format!("indexing {done}/{total}") };
+                    if last {
+                        done += 1;
+                    }
+                    *note.borrow_mut() = if done == total {
+                        String::new()
+                    } else if quiet_count {
+                        format!("loading history… {count} messages")
+                    } else {
+                        format!("indexing {done}/{total}")
+                    };
                     if panel.is_visible() {
                         run();
                     }
                 }
             });
+        })
+    };
+    // All chats: the 4 newest pages (200 messages) of each.
+    let ensure_all: Rc<dyn Fn()> = {
+        let (chats, fetched, index_job) = (h.chats.clone(), fetched.clone(), index_job.clone());
+        Rc::new(move || {
+            let targets: Vec<(String, String)> = chats()
+                .into_iter()
+                .filter(|(id, _)| fetched.borrow().get(id).is_none_or(|t| t.elapsed() > REINDEX_AFTER))
+                .collect();
+            index_job(targets, 4, fetched.clone(), false);
+        })
+    };
+    // This chat: its whole loaded history, up to 40 pages (2000 messages).
+    let ensure_deep: Rc<dyn Fn()> = {
+        let (chats, current, deep, index_job) = (h.chats.clone(), h.current.clone(), deep.clone(), index_job.clone());
+        Rc::new(move || {
+            let Some(cur) = current() else { return };
+            if deep.borrow().get(&cur).is_some_and(|t| t.elapsed() <= REINDEX_AFTER * 5) {
+                return;
+            }
+            let title = chats().into_iter().find(|(id, _)| *id == cur).map(|(_, t)| t).unwrap_or_default();
+            index_job(vec![(cur, title)], 40, deep.clone(), true);
         })
     };
 
@@ -451,10 +515,13 @@ pub fn build(h: Hooks) -> Finder {
         entry.connect_search_changed(move |_| run());
     }
     {
-        let (run, ensure_all, scope_all) = (run.clone(), ensure_all.clone(), scope_all.clone());
+        let (run, ensure_all, ensure_deep, scope_all) =
+            (run.clone(), ensure_all.clone(), ensure_deep.clone(), scope_all.clone());
         scope_all.connect_toggled(move |b| {
             if b.is_active() {
                 ensure_all();
+            } else {
+                ensure_deep();
             }
             run();
         });
@@ -511,8 +578,9 @@ pub fn build(h: Hooks) -> Finder {
     }
 
     let open: Rc<dyn Fn(bool)> = {
-        let (panel, entry, scope_all, scope_chat, run, ensure_all) = (
+        let (panel, entry, scope_all, scope_chat, run, ensure_all, ensure_deep) = (
             panel.clone(), entry.clone(), scope_all.clone(), scope_chat.clone(), run.clone(), ensure_all.clone(),
+            ensure_deep.clone(),
         );
         Rc::new(move |all: bool| {
             panel.set_visible(true);
@@ -523,9 +591,15 @@ pub fn build(h: Hooks) -> Finder {
             }
             if all {
                 ensure_all();
+            } else {
+                ensure_deep();
             }
-            entry.grab_focus();
-            entry.select_region(0, -1);
+            // Focus once the panel is mapped, otherwise Esc and typing go to the page behind.
+            let entry = entry.clone();
+            glib::idle_add_local_once(move || {
+                entry.grab_focus();
+                entry.select_region(0, -1);
+            });
             run();
         })
     };
