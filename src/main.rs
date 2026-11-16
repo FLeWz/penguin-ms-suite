@@ -12,8 +12,8 @@ const APP_ID: &str = "dev.penguin.MsSuite";
 type Builder = fn() -> Page;
 // (name, icon, builder, required Graph permission)
 const APPS: [(&str, &str, Builder, &str); 4] = [
-    ("Outlook", "mail-unread-symbolic", pages::outlook::build, "Mail.Read"),
     ("Teams", "user-available-symbolic", pages::teams::build, "Chat.ReadWrite"),
+    ("Outlook", "mail-unread-symbolic", pages::outlook::build, "Mail.Read"),
     ("Calendar", "x-office-calendar-symbolic", pages::calendar::build, "Calendars.Read"),
     ("Excel", "x-office-spreadsheet-symbolic", pages::excel::build, "Files.Read"),
 ];
