@@ -97,6 +97,33 @@ fn icon_button(icon: &str, tip: &str) -> gtk::Button {
     b
 }
 
+/// Unread = the last message is from someone else, is newer than the read marker
+/// Teams stores for me (`viewpoint`), and has not been opened here. `fresh` covers
+/// chats that got a new message during this session even if the marker is missing.
+fn is_unread(
+    c: &Value,
+    my_id: &str,
+    read_local: &HashMap<String, String>,
+    fresh: &HashSet<String>,
+) -> bool {
+    let cid = c["id"].as_str().unwrap_or("");
+    let prev = &c["lastMessagePreview"];
+    let Some(pid) = prev["id"].as_str() else { return false };
+    if prev["from"]["user"]["id"].as_str() == Some(my_id)
+        || read_local.get(cid).is_some_and(|r| r == pid)
+    {
+        return false;
+    }
+    let server = match c["viewpoint"]["lastMessageReadDateTime"].as_str() {
+        Some(read) => {
+            let when = |t: &str| finder::parse_time(t).1;
+            when(prev["createdDateTime"].as_str().unwrap_or("")) > when(read)
+        }
+        None => false,
+    };
+    server || fresh.contains(cid)
+}
+
 /// One chat message as a bubble: mine on the right (accent colour), others on the left.
 fn bubble(who: &str, text: &str, when: &str, mine: bool) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -416,12 +443,16 @@ pub fn build() -> Page {
     let pending: Rc<RefCell<Vec<Value>>> = Default::default();
     // Lets row buttons re-render the list (render refers to itself through this cell).
     let render_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
+    // Unread tracking: chat -> last message id opened here; chats with new messages this session.
+    let read_local: Rc<RefCell<HashMap<String, String>>> = Default::default();
+    let fresh: Rc<RefCell<HashSet<String>>> = Default::default();
 
     let render: Rc<dyn Fn()> = {
         let (chats, ids, current, quiet, cache, prefs, render_cell, show_hidden, titles) = (
             chats.clone(), ids.clone(), current.clone(), quiet.clone(), cache.clone(),
             prefs.clone(), render_cell.clone(), show_hidden.clone(), titles.clone(),
         );
+        let (read_local, fresh) = (read_local.clone(), fresh.clone());
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
             {
@@ -463,7 +494,17 @@ pub fn build() -> Page {
                     let is_fav = p.fav.contains(&cid);
                     let is_hidden = p.hidden.contains(&cid);
 
+                    let unread = is_unread(c, &my_id, &read_local.borrow(), &fresh.borrow());
                     let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                    // Green dot; kept (transparent) when read so titles do not shift.
+                    let dot = gtk::Image::from_icon_name("media-record-symbolic");
+                    dot.add_css_class("success");
+                    dot.set_margin_start(6);
+                    dot.set_opacity(if unread { 1.0 } else { 0.0 });
+                    if unread {
+                        dot.set_tooltip_text(Some("Unread"));
+                    }
+                    line.append(&dot);
                     let info = util::row(&chat_title(c, &my_id), &prev);
                     info.set_hexpand(true);
                     line.append(&info);
@@ -518,6 +559,7 @@ pub fn build() -> Page {
     let do_refresh: Rc<dyn Fn(bool)> = {
         let pending_c = pending.clone();
         let primed_c = primed.clone();
+        let fresh_c = fresh.clone();
         let busy_c = list_busy.clone();
         let pen_c = penalty.clone();
         let (chats, current, load_msgs, seen, me, signature, cache, prefs, render) = (
@@ -527,6 +569,7 @@ pub fn build() -> Page {
         Rc::new(move |polling: bool| {
             let pending = pending_c.clone();
             let primed = primed_c.clone();
+            let fresh = fresh_c.clone();
             let (list_busy, penalty) = (busy_c.clone(), pen_c.clone());
             list_busy.set(true);
             let (chats, current, load_msgs, seen, me2, signature, cache, prefs, render) = (
@@ -587,6 +630,9 @@ pub fn build() -> Page {
                         }
                         let is_current = current.borrow().as_deref() == Some(cid);
                         new_in_current |= is_current;
+                        if !is_current {
+                            fresh.borrow_mut().insert(cid.to_string());
+                        }
                         if prefs.borrow().hidden.contains(cid) {
                             continue; // hidden chats stay silent
                         }
@@ -846,6 +892,36 @@ pub fn build() -> Page {
         })
     };
 
+    // Mark the open chat read once it is on screen in the focused window: locally, and on the
+    // Teams server (best effort) so other devices clear it too.
+    let mark_read: Rc<dyn Fn(String)> = {
+        let (cache, read_local, fresh, render, me) =
+            (cache.clone(), read_local.clone(), fresh.clone(), render.clone(), me.clone());
+        Rc::new(move |cid: String| {
+            let pid = cache
+                .borrow()
+                .1
+                .iter()
+                .find(|c| c["id"].as_str() == Some(cid.as_str()))
+                .and_then(|c| c["lastMessagePreview"]["id"].as_str().map(String::from));
+            let Some(pid) = pid else { return };
+            if read_local.borrow().get(&cid) == Some(&pid) {
+                return;
+            }
+            read_local.borrow_mut().insert(cid.clone(), pid);
+            fresh.borrow_mut().remove(&cid);
+            let render = render.clone();
+            gtk::glib::idle_add_local_once(move || render());
+            let my = me.borrow().clone();
+            if let Ok((_, tenant)) = crate::auth::config() {
+                if tenant.len() == 36 && !my.is_empty() {
+                    let body = json!({"user": {"id": my, "tenantId": tenant}});
+                    util::run(move || graph::post(&format!("/chats/{cid}/markChatReadForUser"), &body), |_| {});
+                }
+            }
+        })
+    };
+
     // Scheduler, 500 ms resolution. With a healthy relay: slow safety-net poll only.
     // Without: 10 s background, 5 s focused, 2 s for the open chat.
     {
@@ -853,6 +929,7 @@ pub fn build() -> Page {
             do_refresh.clone(), poll_chat.clone(), current.clone(), list_busy.clone(),
             chat_busy.clone(), penalty.clone(),
         );
+        let mark_read = mark_read.clone();
         let weak = overlay.downgrade();
         let (mut last_list, mut last_chat) = (Instant::now(), Instant::now());
         gtk::glib::timeout_add_local(Duration::from_millis(500), move || {
@@ -866,6 +943,12 @@ pub fn build() -> Page {
             let watching = focused && ov.is_mapped(); // Teams on screen in the focused window
             let pushing = relay::healthy();
             let extra = Duration::from_secs(penalty.get() as u64);
+            if watching {
+                let open = current.borrow().clone();
+                if let Some(c) = open {
+                    mark_read(c);
+                }
+            }
 
             let list_every = if pushing {
                 POLL_SAFETY_NET
