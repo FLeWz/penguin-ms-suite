@@ -213,6 +213,22 @@ fn bubble(
         t.set_max_width_chars(60);
         t.set_xalign(0.0);
         t.set_selectable(true);
+        // GTK selects the whole label when it gets keyboard focus (Tab, or the window being
+        // re-activated). That looks like text selecting itself, so undo a select-all on focus.
+        let fc = gtk::EventControllerFocus::new();
+        let lw = t.downgrade();
+        fc.connect_enter(move |_| {
+            let lw = lw.clone();
+            gtk::glib::idle_add_local_once(move || {
+                if let Some(l) = lw.upgrade() {
+                    let len = l.text().chars().count() as i32;
+                    if len > 0 && l.selection_bounds() == Some((0, len)) {
+                        l.select_region(0, 0);
+                    }
+                }
+            });
+        });
+        t.add_controller(fc);
         b.append(&t);
     }
     for w in link_cards {
@@ -235,6 +251,99 @@ fn bubble(
     b.set_hexpand(true);
     outer.append(&b);
     outer
+}
+
+/// Whole-message selection: Shift+click extends a range of messages, Ctrl+C copies them as
+/// text, Esc or a plain click clears it. (Labels cannot select text across several messages.)
+#[derive(Default)]
+struct MsgSel {
+    items: Vec<(gtk::Widget, String)>,
+    anchor: Option<usize>,
+    range: Option<(usize, usize)>,
+}
+
+impl MsgSel {
+    fn reset(&mut self) {
+        *self = MsgSel::default();
+    }
+
+    fn paint(&self) {
+        for (i, (w, _)) in self.items.iter().enumerate() {
+            let on = self.range.is_some_and(|(a, b)| (a..=b).contains(&i));
+            if on {
+                w.add_css_class("msg-selected");
+            } else {
+                w.remove_css_class("msg-selected");
+            }
+        }
+    }
+
+    fn text(&self) -> Option<String> {
+        let (a, b) = self.range?;
+        Some(self.items[a..=b].iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n\n"))
+    }
+}
+
+fn install_msg_selection(msgs: &gtk::ListBox, right: &gtk::Box, sel: &Rc<RefCell<MsgSel>>) {
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let (sel, msgs) = (sel.clone(), msgs.clone());
+        click.connect_pressed(move |g, _, x, y| {
+            let mut st = sel.borrow_mut();
+            let hit = st.items.iter().position(|(w, _)| {
+                w.compute_bounds(&msgs).is_some_and(|r| r.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)))
+            });
+            let shift = g.current_event_state().contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            match (shift, hit) {
+                (true, Some(i)) => {
+                    let a = st.anchor.unwrap_or(i);
+                    st.anchor = Some(a);
+                    st.range = Some((a.min(i), a.max(i)));
+                    g.set_state(gtk::EventSequenceState::Claimed); // no text selection on this click
+                }
+                (_, hit) => {
+                    st.anchor = hit;
+                    st.range = None;
+                }
+            }
+            st.paint();
+        });
+    }
+    msgs.add_controller(click);
+
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let (sel, right) = (sel.clone(), right.clone());
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let editing = right
+                .root()
+                .and_then(|r| r.focus())
+                .is_some_and(|f| f.is::<gtk::Text>() || f.is::<gtk::TextView>());
+            if editing {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let mut st = sel.borrow_mut();
+            if st.range.is_none() {
+                return gtk::glib::Propagation::Proceed;
+            }
+            if key == gtk::gdk::Key::Escape {
+                st.range = None;
+                st.paint();
+                return gtk::glib::Propagation::Stop;
+            }
+            if mods.contains(gtk::gdk::ModifierType::CONTROL_MASK) && matches!(key, gtk::gdk::Key::c | gtk::gdk::Key::C) {
+                if let Some(t) = st.text() {
+                    right.clipboard().set_text(&t);
+                }
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    right.add_controller(keys);
 }
 
 /// Scroll the message list so widget `w` (a message row) is near the top third.
@@ -262,6 +371,7 @@ pub fn build() -> Page {
              .chat-menu button { min-height: 0; min-width: 0; padding: 2px; border-radius: 6px; }
              .chat-menu image { -gtk-icon-size: 12px; }
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
+             .msg-selected { background: alpha(@accent_bg_color, 0.25); border-radius: 8px; }
              .thumb { transition: opacity 250ms ease-in; }
              .thumb-placeholder { background: alpha(currentColor, 0.07); border-radius: 8px; }
              .attach-chip { background: alpha(currentColor, 0.09); border-radius: 8px; padding: 2px 4px 2px 8px; }
@@ -339,6 +449,7 @@ pub fn build() -> Page {
     // Message id to bring into view after loading (from the finder), and the rows by id.
     let jump: Rc<RefCell<Option<String>>> = Default::default();
     let rows: Rc<RefCell<HashMap<String, gtk::Widget>>> = Default::default();
+    let msg_sel: Rc<RefCell<MsgSel>> = Default::default();
     // Scroll position held across a live reload when the user is reading history.
     let hold: Rc<Cell<Option<f64>>> = Default::default();
     {
@@ -467,6 +578,7 @@ pub fn build() -> Page {
     msg_overlay.add_overlay(&jump_rev);
     msg_overlay.set_vexpand(true);
     right.append(&msg_overlay);
+    install_msg_selection(&msgs, &right, &msg_sel);
     right.append(&tray.widget);
     right.append(&compose);
     attach::install_drop(&right, &tray);
@@ -528,6 +640,7 @@ pub fn build() -> Page {
         let media_c = media.clone();
         let links_c = link_previews.clone();
         let one_c = one_on_one.clone();
+        let sel_c = msg_sel.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -543,6 +656,7 @@ pub fn build() -> Page {
             let media = media_c.clone();
             let link_previews = links_c.clone();
             let is_one = one_c.borrow().contains(&id);
+            let sel = sel_c.clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -591,6 +705,7 @@ pub fn build() -> Page {
                     finder::add(&index, finder::parse(&cid, &title, &all));
                     util::clear(&msgs);
                     rows.borrow_mut().clear();
+                    sel.borrow_mut().reset();
                     let mut items = all;
                     // The API orders by last-modified (edited messages jump ahead), so sort by
                     // creation time, oldest first, for display.
@@ -619,6 +734,8 @@ pub fn build() -> Page {
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
+                        let who_copy = if mine { "Me" } else { who };
+                        sel.borrow_mut().items.push((r.clone().upcast(), format!("{who_copy}, {when}\n{text}")));
                         msgs.append(&r);
                     }
                     apply_jump();
