@@ -355,6 +355,31 @@ struct Drawn {
     more: Option<gtk::Widget>,
 }
 
+/// Scroll anchor: the first message row in view and its distance from the viewport top.
+/// When content above it changes height (older page inserted, image or link card loaded)
+/// the scroll value is moved by the same amount, so what you are reading stays put.
+type Anchor = Rc<RefCell<Option<(gtk::glib::WeakRef<gtk::Widget>, f64)>>>;
+
+fn record_anchor(msgs: &gtk::ListBox, a: &gtk::Adjustment, anchor: &Anchor) {
+    let top = a.value();
+    let mut child = msgs.first_child();
+    while let Some(w) = child {
+        child = w.next_sibling();
+        // The "Load older messages" row is replaced on reloads: never anchor to it.
+        let is_button = w.downcast_ref::<gtk::ListBoxRow>().and_then(|r| r.child()).is_some_and(|c| c.is::<gtk::Button>());
+        if is_button {
+            continue;
+        }
+        if let Some(b) = w.compute_bounds(msgs) {
+            if (b.y() + b.height()) as f64 > top + 1.0 {
+                *anchor.borrow_mut() = Some((w.downgrade(), b.y() as f64 - top));
+                return;
+            }
+        }
+    }
+    *anchor.borrow_mut() = None;
+}
+
 /// Whole-message selection: Shift+click extends a range of messages, Ctrl+C copies them as
 /// text, Esc or a plain click clears it. (Labels cannot select text across several messages.)
 #[derive(Default)]
@@ -566,17 +591,26 @@ pub fn build() -> Page {
     let drawn: Rc<RefCell<Drawn>> = Default::default();
     // (upper, value) before older messages were added above: keeps the reading position.
     let prepend: Rc<Cell<Option<(f64, f64)>>> = Default::default();
+    let anchor: Anchor = Default::default();
+    // Set while the list is rebuilt from scratch (rows, and so the anchor, are replaced).
+    let anchor_frozen: Rc<Cell<bool>> = Default::default();
     // Loads the next older page; filled in once `load_msgs` exists.
     let more_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
     {
         let (stick, jump, rows, msgs, hold) =
             (stick.clone(), jump.clone(), rows.clone(), msgs.clone(), hold.clone());
         let prepend_c = prepend.clone();
+        let anchor_c = anchor.clone();
         let programmatic = Rc::new(Cell::new(false));
         {
             let (stick, settling, programmatic) = (stick.clone(), settling.clone(), programmatic.clone());
             let more_cell = more_cell.clone();
+            let (anchor, frozen, msgs) = (anchor.clone(), anchor_frozen.clone(), msgs.clone());
+            let programmatic2 = programmatic.clone();
             msg_scroll.vadjustment().connect_value_changed(move |a| {
+                if !programmatic2.get() && !frozen.get() {
+                    record_anchor(&msgs, a, &anchor);
+                }
                 if !programmatic.get() && !settling.get() {
                     stick.set(a.upper() - a.page_size() - a.value() < 24.0);
                     // Near the top while reading history: fetch the next older page.
@@ -603,11 +637,24 @@ pub fn build() -> Page {
                 msgs.clone(), hold.clone(), programmatic.clone(),
             );
             let prepend = prepend_c.clone();
+            let anchor = anchor_c.clone();
             gtk::glib::idle_add_local_once(move || {
                 pending.set(false);
                 let target = jump.borrow().clone();
                 if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
                     scroll_to(&msgs, &a, &w); // keep it in view while labels settle
+                } else if let Some(y) = anchor
+                    .borrow()
+                    .as_ref()
+                    .and_then(|(w, off)| w.upgrade().and_then(|w| w.compute_bounds(&msgs)).map(|b| b.y() as f64 - off))
+                    .filter(|_| !stick.get())
+                {
+                    // Keep the row that was in view at the same place on screen.
+                    if (a.value() - y).abs() > 0.5 {
+                        programmatic.set(true);
+                        a.set_value(y);
+                        programmatic.set(false);
+                    }
                 } else if let Some((upper, value)) = prepend.get() {
                     programmatic.set(true);
                     a.set_value(a.upper() - upper + value); // same messages stay under the eyes
@@ -781,6 +828,7 @@ pub fn build() -> Page {
         let sel_c = msg_sel.clone();
         let (older_c, prepend_c, more_c) = (older.clone(), prepend.clone(), more_cell.clone());
         let drawn_c = drawn.clone();
+        let (anchor_l, frozen_l) = (anchor.clone(), anchor_frozen.clone());
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -799,6 +847,7 @@ pub fn build() -> Page {
             let sel = sel_c.clone();
             let (older, prepend, more_cell) = (older_c.clone(), prepend_c.clone(), more_c.clone());
             let drawn = drawn_c.clone();
+            let (anchor, anchor_frozen) = (anchor_l.clone(), frozen_l.clone());
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -986,6 +1035,12 @@ pub fn build() -> Page {
                         d.sigs = entries.iter().map(|e| e.1).collect();
                         d.more = more_now;
                     } else {
+                        anchor_frozen.set(true);
+                        *anchor.borrow_mut() = None;
+                        gtk::glib::timeout_add_local_once(Duration::from_millis(700), {
+                            let frozen = anchor_frozen.clone();
+                            move || frozen.set(false)
+                        });
                         util::clear(&msgs);
                         rows.borrow_mut().clear();
                         sel.borrow_mut().reset();
