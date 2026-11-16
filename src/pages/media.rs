@@ -356,6 +356,11 @@ impl Media {
         })
     }
 
+    /// Whether the message has any photo, video or file attachment to show.
+    pub fn has_media(m: &Value) -> bool {
+        !items(m).is_empty()
+    }
+
     /// Handler for the "Forward…" menu entry (owner shows a chat chooser and sends).
     pub fn set_forward(&self, f: ForwardFn) {
         *self.forward.borrow_mut() = Some(f);

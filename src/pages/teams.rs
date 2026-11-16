@@ -344,6 +344,17 @@ struct Older {
 /// Stop paging back after this many older messages (keeps memory and widget count bounded).
 const MAX_OLDER: usize = 1500;
 
+/// What the message list currently shows, so a reload can add or change only what is new
+/// instead of rebuilding every row (which flickers and loses the scroll position).
+#[derive(Default)]
+struct Drawn {
+    chat: String,
+    ids: Vec<String>,
+    sigs: Vec<u64>,
+    /// The "Load older messages" row, if shown.
+    more: Option<gtk::Widget>,
+}
+
 /// Whole-message selection: Shift+click extends a range of messages, Ctrl+C copies them as
 /// text, Esc or a plain click clears it. (Labels cannot select text across several messages.)
 #[derive(Default)]
@@ -552,6 +563,7 @@ pub fn build() -> Page {
     // Scroll position held across a live reload when the user is reading history.
     let hold: Rc<Cell<Option<f64>>> = Default::default();
     let older: Rc<RefCell<Older>> = Default::default();
+    let drawn: Rc<RefCell<Drawn>> = Default::default();
     // (upper, value) before older messages were added above: keeps the reading position.
     let prepend: Rc<Cell<Option<(f64, f64)>>> = Default::default();
     // Loads the next older page; filled in once `load_msgs` exists.
@@ -768,6 +780,7 @@ pub fn build() -> Page {
         let one_c = one_on_one.clone();
         let sel_c = msg_sel.clone();
         let (older_c, prepend_c, more_c) = (older.clone(), prepend.clone(), more_cell.clone());
+        let drawn_c = drawn.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -785,6 +798,7 @@ pub fn build() -> Page {
             let is_one = one_c.borrow().contains(&id);
             let sel = sel_c.clone();
             let (older, prepend, more_cell) = (older_c.clone(), prepend_c.clone(), more_c.clone());
+            let drawn = drawn_c.clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -860,10 +874,49 @@ pub fn build() -> Page {
                         );
                     }
                     finder::add(&index, finder::parse(&cid, &title, &items));
-                    util::clear(&msgs);
-                    rows.borrow_mut().clear();
-                    sel.borrow_mut().reset();
-                    if older.borrow().next.is_some() && older.borrow().msgs.len() < MAX_OLDER {
+                    // The API orders by last-modified (edited messages jump ahead), so sort by
+                    // creation time, oldest first, for display.
+                    items.sort_by(|a, b| {
+                        a["createdDateTime"].as_str().unwrap_or("").cmp(b["createdDateTime"].as_str().unwrap_or(""))
+                    });
+                    // (id, content signature, text, message) of every row to show.
+                    let entries: Vec<(String, u64, String, Value)> = items
+                        .into_iter()
+                        .filter_map(|m| {
+                            let text = util::message_text(
+                                m["body"]["content"].as_str().unwrap_or(""),
+                                m["body"]["contentType"].as_str().unwrap_or("html"),
+                            );
+                            if text.is_empty() && !media::Media::has_media(&m) {
+                                return None;
+                            }
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            m["lastModifiedDateTime"].as_str().hash(&mut h);
+                            m["deletedDateTime"].as_str().hash(&mut h);
+                            m["body"]["content"].as_str().hash(&mut h);
+                            Some((m["id"].as_str().unwrap_or("").to_string(), h.finish(), text, m))
+                        })
+                        .collect();
+                    let make_row = |text: &str, m: &Value| -> (gtk::Box, String) {
+                        let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
+                        let media_widgets = media.widgets(m);
+                        let link_cards = link_previews.widgets(m, text);
+                        let mine = !my_id.is_empty() && m["from"]["user"]["id"].as_str() == Some(my_id.as_str());
+                        let when = finder::parse_time(m["createdDateTime"].as_str().unwrap_or("")).0;
+                        let markup = util::message_markup(
+                            m["body"]["content"].as_str().unwrap_or(""),
+                            m["body"]["contentType"].as_str().unwrap_or("html"),
+                        );
+                        let r = bubble(if is_one { "" } else { who }, text, &markup, &when, mine, &media_widgets, &link_cards);
+                        if let Some(mid) = m["id"].as_str() {
+                            rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
+                        }
+                        let who_copy = if mine { "Me" } else { who };
+                        (r, format!("{who_copy}, {when}\n{text}"))
+                    };
+                    let want_more = older.borrow().next.is_some() && older.borrow().msgs.len() < MAX_OLDER;
+                    let make_more = || -> gtk::Widget {
                         // Also reachable without scrolling (short chats, or no scrollbar).
                         let more = gtk::Button::with_label("Load older messages");
                         more.add_css_class("flat");
@@ -877,38 +930,81 @@ pub fn build() -> Page {
                                 f();
                             }
                         });
-                        msgs.append(&more);
-                    }
-                    // The API orders by last-modified (edited messages jump ahead), so sort by
-                    // creation time, oldest first, for display.
-                    items.sort_by(|a, b| {
-                        a["createdDateTime"].as_str().unwrap_or("").cmp(b["createdDateTime"].as_str().unwrap_or(""))
-                    });
-                    for m in items {
-                        let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
-                        let text = util::message_text(
-                            m["body"]["content"].as_str().unwrap_or(""),
-                            m["body"]["contentType"].as_str().unwrap_or("html"),
-                        );
-                        let media_widgets = media.widgets(&m);
-                        let link_cards = link_previews.widgets(&m, &text);
-                        if text.is_empty() && media_widgets.is_empty() {
-                            continue;
+                        more.upcast()
+                    };
+
+                    // Incremental update when everything already shown is unchanged and sits as one
+                    // run inside the new list: add only the rows before and after it.
+                    let split = {
+                        let d = drawn.borrow();
+                        let n = d.ids.len();
+                        let ok = d.chat == cid
+                            && n > 0
+                            && jump.borrow().is_none()
+                            && d.ids.iter().all(|i| !i.is_empty());
+                        ok.then(|| entries.iter().position(|e| e.0 == d.ids[0]))
+                            .flatten()
+                            .filter(|k| {
+                                k + n <= entries.len()
+                                    && (0..n).all(|i| entries[k + i].0 == d.ids[i] && entries[k + i].1 == d.sigs[i])
+                            })
+                    };
+                    if let Some(k) = split {
+                        let n = drawn.borrow().ids.len();
+                        let had_more = drawn.borrow().more.clone();
+                        let mut more_now = had_more.clone();
+                        if want_more != had_more.is_some() || k > 0 {
+                            if let Some(w) = had_more.as_ref().and_then(|w| w.parent()) {
+                                msgs.remove(&w);
+                            }
+                            more_now = None;
                         }
-                        let mine = !my_id.is_empty()
-                            && m["from"]["user"]["id"].as_str() == Some(my_id.as_str());
-                        let when = finder::parse_time(m["createdDateTime"].as_str().unwrap_or("")).0;
-                        let markup = util::message_markup(
-                            m["body"]["content"].as_str().unwrap_or(""),
-                            m["body"]["contentType"].as_str().unwrap_or("html"),
-                        );
-                        let r = bubble(if is_one { "" } else { who }, &text, &markup, &when, mine, &media_widgets, &link_cards);
-                        if let Some(mid) = m["id"].as_str() {
-                            rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
+                        let base = more_now.is_some() as i32;
+                        for (i, e) in entries[..k].iter().enumerate() {
+                            let (r, copy) = make_row(&e.2, &e.3);
+                            msgs.insert(&r, base + i as i32);
+                            sel.borrow_mut().items.insert(i, (r.upcast(), copy));
                         }
-                        let who_copy = if mine { "Me" } else { who };
-                        sel.borrow_mut().items.push((r.clone().upcast(), format!("{who_copy}, {when}\n{text}")));
-                        msgs.append(&r);
+                        if k > 0 {
+                            let mut st = sel.borrow_mut();
+                            st.anchor = None; // indices shifted
+                            st.range = None;
+                            st.paint();
+                        }
+                        for e in &entries[k + n..] {
+                            let (r, copy) = make_row(&e.2, &e.3);
+                            msgs.append(&r);
+                            sel.borrow_mut().items.push((r.upcast(), copy));
+                        }
+                        if more_now.is_none() && want_more {
+                            let w = make_more();
+                            msgs.insert(&w, 0);
+                            more_now = Some(w);
+                        }
+                        let mut d = drawn.borrow_mut();
+                        d.ids = entries.iter().map(|e| e.0.clone()).collect();
+                        d.sigs = entries.iter().map(|e| e.1).collect();
+                        d.more = more_now;
+                    } else {
+                        util::clear(&msgs);
+                        rows.borrow_mut().clear();
+                        sel.borrow_mut().reset();
+                        let more = want_more.then(|| {
+                            let w = make_more();
+                            msgs.append(&w);
+                            w
+                        });
+                        for e in &entries {
+                            let (r, copy) = make_row(&e.2, &e.3);
+                            sel.borrow_mut().items.push((r.clone().upcast(), copy));
+                            msgs.append(&r);
+                        }
+                        *drawn.borrow_mut() = Drawn {
+                            chat: cid.clone(),
+                            ids: entries.iter().map(|e| e.0.clone()).collect(),
+                            sigs: entries.iter().map(|e| e.1).collect(),
+                            more,
+                        };
                     }
                     apply_jump();
                 },
