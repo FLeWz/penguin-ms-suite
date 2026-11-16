@@ -105,6 +105,22 @@ fn scroll_to(list: &gtk::ListBox, adj: &gtk::Adjustment, w: &gtk::Widget) -> boo
     true
 }
 
+/// Keep the view at the bottom for ~1 s of frames. Wrapped labels and the
+/// final viewport height settle over several layout passes, so a single
+/// set_value() can land short and leave the newest message cut off.
+fn pin_bottom(scroll: &gtk::ScrolledWindow) {
+    let adj = scroll.vadjustment();
+    let start = Instant::now();
+    scroll.add_tick_callback(move |_, _| {
+        adj.set_value(adj.upper() - adj.page_size());
+        if start.elapsed() > Duration::from_millis(1000) {
+            gtk::glib::ControlFlow::Break
+        } else {
+            gtk::glib::ControlFlow::Continue
+        }
+    });
+}
+
 pub fn build() -> Page {
     static CSS: std::sync::Once = std::sync::Once::new();
     CSS.call_once(|| {
@@ -226,6 +242,7 @@ pub fn build() -> Page {
         );
         let (live_last, hold, shown, adj) =
             (live_last.clone(), hold.clone(), shown.clone(), msg_scroll.vadjustment());
+        let scroll_w = msg_scroll.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -236,6 +253,7 @@ pub fn build() -> Page {
             );
             let (live_last, hold, shown, adj) =
                 (live_last.clone(), hold.clone(), shown.clone(), adj.clone());
+            let scroll_w = scroll_w.clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -263,6 +281,7 @@ pub fn build() -> Page {
                     let at_bottom = adj.upper() - adj.page_size() - adj.value() < 40.0;
                     if jump.borrow().is_none() {
                         if switched || at_bottom {
+                            pin_bottom(&scroll_w);
                             stick.set(true);
                             gtk::glib::timeout_add_local_once(Duration::from_millis(600), move || {
                                 stick.set(false)
