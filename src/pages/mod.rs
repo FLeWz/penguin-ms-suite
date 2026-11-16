@@ -6,6 +6,7 @@ pub mod lightbox;
 pub mod links;
 pub mod media;
 pub mod outlook;
+pub mod reactions;
 pub mod teams;
 
 use std::rc::Rc;

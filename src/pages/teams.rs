@@ -1,4 +1,4 @@
-use super::{attach, finder, links, media, Page};
+use super::{attach, finder, links, media, reactions, Page};
 use crate::relay;
 use crate::{graph, util};
 use adw::prelude::*;
@@ -286,6 +286,7 @@ fn bubble(
     mine: bool,
     media: &[gtk::Widget],
     link_cards: &[gtk::Widget],
+    react: &gtk::Box,
 ) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
     b.add_css_class("bubble");
@@ -334,7 +335,14 @@ fn bubble(
     w.add_css_class("dim-label");
     w.add_css_class("bubble-time");
     w.set_xalign(1.0);
-    b.append(&w);
+    w.set_hexpand(true);
+    w.set_valign(gtk::Align::Center);
+    // Bottom line: reactions (and the hover add button) on the left, time on the right.
+    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    react.set_valign(gtk::Align::Center);
+    bottom.append(react);
+    bottom.append(&w);
+    b.append(&bottom);
 
     let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     outer.set_margin_top(3);
@@ -371,6 +379,8 @@ struct Drawn {
     sigs: Vec<u64>,
     /// The "Load older messages" row, if shown.
     more: Option<gtk::Widget>,
+    /// Reaction fingerprint and handle per row, same order as `ids`.
+    rx: Vec<(u64, Rc<reactions::Reactor>)>,
 }
 
 /// Scroll anchor: the first message row in view and its distance from the viewport top.
@@ -518,6 +528,10 @@ pub fn build() -> Page {
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
              .finder-scrim { background: alpha(black, 0.45); }
              .finder-card { background: @popover_bg_color; color: @popover_fg_color; border: 1px solid alpha(currentColor, 0.18); border-radius: 12px; box-shadow: 0 10px 32px alpha(black, 0.5); }
+             .react-chip { min-height: 0; min-width: 0; padding: 0 8px; border-radius: 999px; background: alpha(currentColor, 0.1); font-size: 0.85em; }
+             .react-mine { background: alpha(@accent_bg_color, 0.35); }
+             .react-add { opacity: 0; min-height: 0; min-width: 0; padding: 1px; }
+             .bubble:hover .react-add, .react-add:checked { opacity: 1; }
              .msg-selected { background: alpha(@accent_bg_color, 0.25); border-radius: 8px; }
              .lightbox { background: alpha(black, 0.85); }
              .thumb { transition: opacity 250ms ease-in; }
@@ -1031,7 +1045,7 @@ pub fn build() -> Page {
                             Some((m["id"].as_str().unwrap_or("").to_string(), h.finish(), text, m))
                         })
                         .collect();
-                    let make_row = |text: &str, m: &Value| -> (gtk::Box, String) {
+                    let make_row = |text: &str, m: &Value| -> (gtk::Box, String, (u64, Rc<reactions::Reactor>)) {
                         let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
                         let media_widgets = media.widgets(m);
                         let link_cards = link_previews.widgets(m, text);
@@ -1041,12 +1055,24 @@ pub fn build() -> Page {
                             m["body"]["content"].as_str().unwrap_or(""),
                             m["body"]["contentType"].as_str().unwrap_or("html"),
                         );
-                        let r = bubble(if is_one { "" } else { who }, text, &markup, &when, mine, &media_widgets, &link_cards);
+                        let (reactor, react_row) =
+                            reactions::Reactor::new(&cid, m["id"].as_str().unwrap_or(""), &my_id);
+                        reactor.refresh(&m["reactions"]);
+                        let r = bubble(
+                            if is_one { "" } else { who },
+                            text,
+                            &markup,
+                            &when,
+                            mine,
+                            &media_widgets,
+                            &link_cards,
+                            &react_row,
+                        );
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
                         let who_copy = if mine { "Me" } else { who };
-                        (r, format!("{who_copy}, {when}\n{text}"))
+                        (r, format!("{who_copy}, {when}\n{text}"), (reactions::sig(&m["reactions"]), reactor))
                     };
                     let want_more = older.borrow().next.is_some() && older.borrow().msgs.len() < MAX_OLDER;
                     let make_more = || -> gtk::Widget {
@@ -1094,10 +1120,24 @@ pub fn build() -> Page {
                             more_now = None;
                         }
                         let base = more_now.is_some() as i32;
+                        // Rows kept as they are: only refresh reactions that changed.
+                        let mut rx: Vec<(u64, Rc<reactions::Reactor>)> = vec![];
                         for (i, e) in entries[..k].iter().enumerate() {
-                            let (r, copy) = make_row(&e.2, &e.3);
+                            let (r, copy, h) = make_row(&e.2, &e.3);
                             msgs.insert(&r, base + i as i32);
                             sel.borrow_mut().items.insert(i, (r.upcast(), copy));
+                            rx.push(h);
+                        }
+                        {
+                            let d = drawn.borrow();
+                            for i in 0..n {
+                                let (old_sig, reactor) = &d.rx[i];
+                                let new_sig = reactions::sig(&entries[k + i].3["reactions"]);
+                                if *old_sig != new_sig {
+                                    reactor.refresh(&entries[k + i].3["reactions"]);
+                                }
+                                rx.push((new_sig, reactor.clone()));
+                            }
                         }
                         if k > 0 {
                             let mut st = sel.borrow_mut();
@@ -1106,9 +1146,10 @@ pub fn build() -> Page {
                             st.paint();
                         }
                         for e in &entries[k + n..] {
-                            let (r, copy) = make_row(&e.2, &e.3);
+                            let (r, copy, h) = make_row(&e.2, &e.3);
                             msgs.append(&r);
                             sel.borrow_mut().items.push((r.upcast(), copy));
+                            rx.push(h);
                         }
                         if more_now.is_none() && want_more {
                             let w = make_more();
@@ -1119,6 +1160,7 @@ pub fn build() -> Page {
                         d.ids = entries.iter().map(|e| e.0.clone()).collect();
                         d.sigs = entries.iter().map(|e| e.1).collect();
                         d.more = more_now;
+                        d.rx = rx;
                     } else {
                         anchor_frozen.set(true);
                         *anchor.borrow_mut() = None;
@@ -1134,16 +1176,19 @@ pub fn build() -> Page {
                             msgs.append(&w);
                             w
                         });
+                        let mut rx = vec![];
                         for e in &entries {
-                            let (r, copy) = make_row(&e.2, &e.3);
+                            let (r, copy, h) = make_row(&e.2, &e.3);
                             sel.borrow_mut().items.push((r.clone().upcast(), copy));
                             msgs.append(&r);
+                            rx.push(h);
                         }
                         *drawn.borrow_mut() = Drawn {
                             chat: cid.clone(),
                             ids: entries.iter().map(|e| e.0.clone()).collect(),
                             sigs: entries.iter().map(|e| e.1).collect(),
                             more,
+                            rx,
                         };
                     }
                     apply_jump();
