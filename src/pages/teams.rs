@@ -243,34 +243,6 @@ fn scroll_to(list: &gtk::ListBox, adj: &gtk::Adjustment, w: &gtk::Widget) -> boo
     true
 }
 
-/// First open of a chat with images or link cards: keep the list invisible while they
-/// arrive and the layout settles (placeholders resize, cards appear), then fade it in.
-/// Without this the first view visibly jumps around. Gives up waiting after 900 ms.
-fn reveal_when_settled(
-    scroll: &gtk::ScrolledWindow,
-    media: &Rc<media::Media>,
-    links: &Rc<links::Links>,
-    epoch: &Rc<Cell<u32>>,
-) {
-    scroll.set_opacity(0.0);
-    epoch.set(epoch.get() + 1);
-    let g = epoch.get();
-    let start = Instant::now();
-    let (scroll, media, links, epoch) = (scroll.clone(), media.clone(), links.clone(), epoch.clone());
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
-        if epoch.get() != g {
-            return gtk::glib::ControlFlow::Break; // another chat took over
-        }
-        let t = start.elapsed();
-        let settled = t >= Duration::from_millis(150) && !media.busy() && !links.busy();
-        if settled || t >= Duration::from_millis(900) {
-            scroll.set_opacity(1.0);
-            return gtk::glib::ControlFlow::Break;
-        }
-        gtk::glib::ControlFlow::Continue
-    });
-}
-
 pub fn build() -> Page {
     static CSS: std::sync::Once = std::sync::Once::new();
     CSS.call_once(|| {
@@ -281,7 +253,6 @@ pub fn build() -> Page {
              .bubble { border-radius: 14px; padding: 6px 10px; }
              .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
              .bubble-them { background: alpha(currentColor, 0.09); }
-             .msg-scroll { transition: opacity 150ms ease-in; }
              .chat-list row { min-height: 0; padding: 0 2px; margin: 2px 4px; border-radius: 6px; }
              .chat-title { font-size: 0.92em; }
              .chat-preview { font-size: 0.75em; }
@@ -430,7 +401,6 @@ pub fn build() -> Page {
     let live_last: Rc<RefCell<HashMap<String, String>>> = Default::default();
     // Chat whose messages are currently shown (to tell a chat switch from a live reload).
     let shown: Rc<RefCell<Option<String>>> = Default::default();
-    let reveal_gen: Rc<Cell<u32>> = Default::default();
     // Backoff (seconds) added to poll intervals after errors, e.g. throttling.
     let penalty: Rc<Cell<u32>> = Default::default();
     let list_busy = Rc::new(Cell::new(false));
@@ -554,7 +524,6 @@ pub fn build() -> Page {
         let me = me.clone();
         let media_c = media.clone();
         let links_c = link_previews.clone();
-        let (scroll_c, gen_c) = (msg_scroll.clone(), reveal_gen.clone());
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -569,7 +538,6 @@ pub fn build() -> Page {
             let my_id = me.borrow().clone();
             let media = media_c.clone();
             let link_previews = links_c.clone();
-            let (scroll_w, reveal_gen) = (scroll_c.clone(), gen_c.clone());
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -618,7 +586,6 @@ pub fn build() -> Page {
                     finder::add(&index, finder::parse(&cid, &title, &all));
                     util::clear(&msgs);
                     rows.borrow_mut().clear();
-                    let mut async_content = false; // images or link cards that load after the rows exist
                     let mut items = all;
                     // The API orders by last-modified (edited messages jump ahead), so sort by
                     // creation time, oldest first, for display.
@@ -636,7 +603,6 @@ pub fn build() -> Page {
                         if text.is_empty() && media_widgets.is_empty() {
                             continue;
                         }
-                        async_content |= !media_widgets.is_empty() || !link_cards.is_empty();
                         let mine = !my_id.is_empty()
                             && m["from"]["user"]["id"].as_str() == Some(my_id.as_str());
                         let when = finder::parse_time(m["createdDateTime"].as_str().unwrap_or("")).0;
@@ -649,14 +615,6 @@ pub fn build() -> Page {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
                         msgs.append(&r);
-                    }
-                    if switched {
-                        if async_content {
-                            reveal_when_settled(&scroll_w, &media, &link_previews, &reveal_gen);
-                        } else {
-                            reveal_gen.set(reveal_gen.get() + 1); // cancel a pending reveal
-                            scroll_w.set_opacity(1.0);
-                        }
                     }
                     apply_jump();
                 },

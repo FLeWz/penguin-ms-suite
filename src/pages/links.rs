@@ -324,6 +324,10 @@ fn fetch_preview(url: &str) -> Option<(Preview, Option<Vec<u8>>)> {
 
 // ---------- UI ----------
 
+/// Height reserved for a link card while it loads; loaded cards use it as their minimum
+/// height, so swapping the placeholder for the card barely moves the chat.
+const CARD_H: i32 = 104;
+
 pub struct Links {
     enabled: bool,
     /// url -> preview (None = tried, nothing to show)
@@ -336,11 +340,6 @@ impl Links {
     pub fn new() -> Rc<Self> {
         let enabled = std::env::var("PENGUIN_MS_LINK_PREVIEWS").map_or(true, |v| v != "0");
         Rc::new(Links { enabled, previews: Default::default(), textures: Default::default(), inflight: Default::default() })
-    }
-
-    /// True while any link preview is still being fetched.
-    pub fn busy(&self) -> bool {
-        !self.inflight.borrow().is_empty()
     }
 
     /// Preview cards for links in the message; cards appear when the fetch finishes.
@@ -358,6 +357,8 @@ impl Links {
                     Some(Some(p)) => self.show(&holder, &url, &p),
                     Some(None) => {}
                     None => {
+                        holder.set_size_request(-1, CARD_H);
+                        holder.add_css_class("thumb-placeholder");
                         if self.inflight.borrow_mut().insert(url.clone()) {
                             let (me, weak, u) = (self.clone(), holder.downgrade(), url.clone());
                             util::run(
@@ -366,6 +367,10 @@ impl Links {
                                     me.inflight.borrow_mut().remove(&url);
                                     let Some((p, img)) = r else {
                                         me.previews.borrow_mut().insert(url, None);
+                                        if let Some(h) = weak.upgrade() {
+                                            h.set_size_request(-1, -1); // no card: give the space back
+                                            h.remove_css_class("thumb-placeholder");
+                                        }
                                         return;
                                     };
                                     if let (Some(src), Some(bytes)) = (p.image.clone(), img) {
@@ -394,6 +399,9 @@ impl Links {
     fn show(&self, holder: &gtk::Box, url: &str, p: &Preview) {
         let card = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         card.add_css_class("link-card");
+        card.set_size_request(-1, CARD_H);
+        holder.set_size_request(-1, -1);
+        holder.remove_css_class("thumb-placeholder");
         if let Some(t) = p.image.as_ref().and_then(|i| self.textures.borrow().get(i).cloned()) {
             let (w, h) = (t.width() as f64, t.height() as f64);
             let (maxw, maxh) = if p.video { (160.0, 90.0) } else { (96.0, 96.0) };
