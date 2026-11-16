@@ -51,9 +51,10 @@ pub struct Reactor {
 }
 
 impl Reactor {
-    /// Returns the reactor and the row to put in the bubble (chips and the add button).
-    pub fn new(chat: &str, message: &str, my_id: &str) -> (Rc<Self>, gtk::Box) {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    /// Returns the reactor, the chips row (to straddle the bubble's bottom edge) and the
+    /// hover "add reaction" button (to put inside the bubble).
+    pub fn new(chat: &str, message: &str, my_id: &str) -> (Rc<Self>, gtk::Box, Option<gtk::Widget>) {
+        let mut add_btn = None;
         let chips = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let me = Rc::new(Reactor {
             chat: chat.to_string(),
@@ -62,7 +63,6 @@ impl Reactor {
             chips: chips.clone(),
             mine: Default::default(),
         });
-        row.append(&chips);
         if !message.is_empty() {
             let add = gtk::MenuButton::new();
             add.set_icon_name("face-smile-symbolic");
@@ -85,9 +85,9 @@ impl Reactor {
             }
             pop.set_child(Some(&strip));
             add.set_popover(Some(&pop));
-            row.append(&add);
+            add_btn = Some(add.upcast());
         }
-        (me, row)
+        (me, chips, add_btn)
     }
 
     /// Redraw the chips from the message's `reactions` array.

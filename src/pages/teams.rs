@@ -286,7 +286,8 @@ fn bubble(
     mine: bool,
     media: &[gtk::Widget],
     link_cards: &[gtk::Widget],
-    react: &gtk::Box,
+    chips: &gtk::Box,
+    add_react: Option<&gtk::Widget>,
 ) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
     b.add_css_class("bubble");
@@ -337,10 +338,12 @@ fn bubble(
     w.set_xalign(1.0);
     w.set_hexpand(true);
     w.set_valign(gtk::Align::Center);
-    // Bottom line: reactions (and the hover add button) on the left, time on the right.
+    // Bottom line: the hover add-reaction button on the left, time on the right.
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    react.set_valign(gtk::Align::Center);
-    bottom.append(react);
+    if let Some(a) = add_react {
+        a.set_valign(gtk::Align::Center);
+        bottom.append(a);
+    }
     bottom.append(&w);
     b.append(&bottom);
 
@@ -351,8 +354,19 @@ fn bubble(
     outer.set_margin_end(12);
     // Spacer keeps bubbles off the far edge on the opposite side.
     outer.set_halign(gtk::Align::Fill);
-    b.set_hexpand(true);
-    outer.append(&b);
+    // Column: bubble, then the reaction chips painted half over its bottom edge (CSS
+    // transform; the chips keep their own row of layout space below the bubble).
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let align = if mine { gtk::Align::End } else { gtk::Align::Start };
+    col.set_hexpand(true);
+    col.set_halign(align);
+    b.set_hexpand(false);
+    b.set_halign(align);
+    chips.add_css_class("react-straddle");
+    chips.set_halign(align);
+    col.append(&b);
+    col.append(chips);
+    outer.append(&col);
     outer
 }
 
@@ -528,7 +542,8 @@ pub fn build() -> Page {
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
              .finder-scrim { background: alpha(black, 0.45); }
              .finder-card { background: @popover_bg_color; color: @popover_fg_color; border: 1px solid alpha(currentColor, 0.18); border-radius: 12px; box-shadow: 0 10px 32px alpha(black, 0.5); }
-             .react-chip { min-height: 0; min-width: 0; padding: 0 8px; border-radius: 999px; background: alpha(currentColor, 0.1); font-size: 0.85em; }
+             .react-straddle { transform: translate(0, -11px); margin-left: 10px; margin-right: 10px; }
+             .react-chip { min-height: 22px; min-width: 0; padding: 0 8px; border-radius: 999px; background: alpha(currentColor, 0.1); font-size: 0.85em; }
              .react-mine { background: alpha(@accent_bg_color, 0.35); }
              .react-add { opacity: 0; min-height: 0; min-width: 0; padding: 1px; }
              .bubble:hover .react-add, .react-add:checked { opacity: 1; }
@@ -1055,7 +1070,7 @@ pub fn build() -> Page {
                             m["body"]["content"].as_str().unwrap_or(""),
                             m["body"]["contentType"].as_str().unwrap_or("html"),
                         );
-                        let (reactor, react_row) =
+                        let (reactor, chips, add_btn) =
                             reactions::Reactor::new(&cid, m["id"].as_str().unwrap_or(""), &my_id);
                         reactor.refresh(&m["reactions"]);
                         let r = bubble(
@@ -1066,7 +1081,8 @@ pub fn build() -> Page {
                             mine,
                             &media_widgets,
                             &link_cards,
-                            &react_row,
+                            &chips,
+                            add_btn.as_ref(),
                         );
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
