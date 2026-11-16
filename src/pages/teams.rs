@@ -97,6 +97,44 @@ fn icon_button(icon: &str, tip: &str) -> gtk::Button {
     b
 }
 
+/// One chat message as a bubble: mine on the right (accent colour), others on the left.
+fn bubble(who: &str, text: &str, when: &str, mine: bool) -> gtk::Box {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    b.add_css_class("bubble");
+    b.add_css_class(if mine { "bubble-me" } else { "bubble-them" });
+    b.set_halign(if mine { gtk::Align::End } else { gtk::Align::Start });
+    if !mine {
+        let n = gtk::Label::new(Some(who));
+        n.set_xalign(0.0);
+        n.add_css_class("heading");
+        b.append(&n);
+    }
+    let t = gtk::Label::new(Some(text));
+    t.set_wrap(true);
+    t.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    t.set_max_width_chars(60);
+    t.set_xalign(0.0);
+    t.set_selectable(true);
+    b.append(&t);
+    let w = gtk::Label::new(Some(when));
+    w.add_css_class("caption");
+    w.add_css_class("dim-label");
+    w.add_css_class("bubble-time");
+    w.set_xalign(1.0);
+    b.append(&w);
+
+    let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    outer.set_margin_top(3);
+    outer.set_margin_bottom(3);
+    outer.set_margin_start(12);
+    outer.set_margin_end(12);
+    // Spacer keeps bubbles off the far edge on the opposite side.
+    outer.set_halign(gtk::Align::Fill);
+    b.set_hexpand(true);
+    outer.append(&b);
+    outer
+}
+
 /// Scroll the message list so widget `w` (a message row) is near the top third.
 fn scroll_to(list: &gtk::ListBox, adj: &gtk::Adjustment, w: &gtk::Widget) -> bool {
     let Some(row) = w.parent() else { return false };
@@ -125,7 +163,14 @@ pub fn build() -> Page {
     static CSS: std::sync::Once = std::sync::Once::new();
     CSS.call_once(|| {
         let p = gtk::CssProvider::new();
-        p.load_from_data(".search-hit { background: alpha(@accent_bg_color, 0.25); border-radius: 6px; }");
+        p.load_from_data(
+            ".search-hit { background: alpha(@accent_bg_color, 0.25); border-radius: 6px; }
+             .message-list row, .message-list row:hover { background: none; }
+             .bubble { border-radius: 14px; padding: 6px 10px; }
+             .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
+             .bubble-them { background: alpha(currentColor, 0.09); }
+             .bubble-me .bubble-time { color: alpha(@accent_fg_color, 0.75); }",
+        );
         if let Some(d) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(&d, &p, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
@@ -134,6 +179,7 @@ pub fn build() -> Page {
     chats.add_css_class("navigation-sidebar");
     let msgs = gtk::ListBox::new();
     msgs.set_selection_mode(gtk::SelectionMode::None);
+    msgs.add_css_class("message-list");
     let entry = gtk::Entry::new();
     entry.set_placeholder_text(Some("Type a message…"));
     entry.set_margin_top(6);
@@ -188,6 +234,7 @@ pub fn build() -> Page {
     let penalty: Rc<Cell<u32>> = Default::default();
     let list_busy = Rc::new(Cell::new(false));
     let chat_busy = Rc::new(Cell::new(false));
+    let me: Rc<RefCell<String>> = Default::default(); // my user id, set by the chat list poll
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     right.append(&msg_scroll);
@@ -243,6 +290,7 @@ pub fn build() -> Page {
         let (live_last, hold, shown, adj) =
             (live_last.clone(), hold.clone(), shown.clone(), msg_scroll.vadjustment());
         let scroll_w = msg_scroll.clone();
+        let me = me.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -254,6 +302,7 @@ pub fn build() -> Page {
             let (live_last, hold, shown, adj) =
                 (live_last.clone(), hold.clone(), shown.clone(), adj.clone());
             let scroll_w = scroll_w.clone();
+            let my_id = me.borrow().clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -308,14 +357,10 @@ pub fn build() -> Page {
                         if text.is_empty() {
                             continue;
                         }
-                        let r = util::row(who, "");
-                        if let Some(l) = r.last_child().and_downcast::<gtk::Label>() {
-                            l.set_text(&text);
-                            l.set_wrap(true);
-                            l.set_single_line_mode(false);
-                            l.set_ellipsize(gtk::pango::EllipsizeMode::None);
-                            l.set_selectable(true);
-                        }
+                        let mine = !my_id.is_empty()
+                            && m["from"]["user"]["id"].as_str() == Some(my_id.as_str());
+                        let when = finder::parse_time(m["createdDateTime"].as_str().unwrap_or("")).0;
+                        let r = bubble(who, &text, &when, mine);
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
@@ -361,7 +406,6 @@ pub fn build() -> Page {
 
     // Latest message id seen per chat, to detect new arrivals. Empty until first load.
     let seen: Rc<RefCell<HashMap<String, String>>> = Default::default();
-    let me: Rc<RefCell<String>> = Default::default();
     // False until the first successful poll: that one only records state, no notifications.
     let primed = Rc::new(std::cell::Cell::new(false));
     let signature: Rc<RefCell<String>> = Default::default();

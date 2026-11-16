@@ -29,7 +29,7 @@ pub struct Msg {
 /// chat id -> messages (newest first).
 pub type Index = Rc<RefCell<HashMap<String, Vec<Msg>>>>;
 
-fn parse_time(iso: &str) -> (String, i64) {
+pub fn parse_time(iso: &str) -> (String, i64) {
     let s = format!("{}Z", iso.trim_end_matches('Z').split('.').next().unwrap_or(iso));
     match glib::DateTime::from_iso8601(&s, None).and_then(|d| d.to_local()) {
         Ok(d) => (
