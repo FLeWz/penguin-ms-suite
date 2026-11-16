@@ -607,8 +607,12 @@ pub fn build() -> Page {
             let more_cell = more_cell.clone();
             let (anchor, frozen, msgs) = (anchor.clone(), anchor_frozen.clone(), msgs.clone());
             let programmatic2 = programmatic.clone();
+            let older_v = older.clone();
             msg_scroll.vadjustment().connect_value_changed(move |a| {
-                if !programmatic2.get() && !frozen.get() {
+                // While an older page is on its way the anchor stays the message that was in
+                // view when the request was made.
+                let loading = older_v.try_borrow().map(|o| o.loading).unwrap_or(false);
+                if !programmatic2.get() && !frozen.get() && !loading {
                     record_anchor(&msgs, a, &anchor);
                 }
                 if !programmatic.get() && !settling.get() {
@@ -829,6 +833,7 @@ pub fn build() -> Page {
         let (older_c, prepend_c, more_c) = (older.clone(), prepend.clone(), more_cell.clone());
         let drawn_c = drawn.clone();
         let (anchor_l, frozen_l) = (anchor.clone(), anchor_frozen.clone());
+        let scroll_l = msg_scroll.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -848,6 +853,7 @@ pub fn build() -> Page {
             let (older, prepend, more_cell) = (older_c.clone(), prepend_c.clone(), more_c.clone());
             let drawn = drawn_c.clone();
             let (anchor, anchor_frozen) = (anchor_l.clone(), frozen_l.clone());
+            let scroll_w = scroll_l.clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -890,6 +896,19 @@ pub fn build() -> Page {
                         }
                     }
                     let prepended = prepend.get().is_some();
+                    if prepended {
+                        // Cleared after the rows are in (below), so the request-time anchor holds.
+                        let older_d = older.clone();
+                        gtk::glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                            older_d.borrow_mut().loading = false;
+                        });
+                        // A fling that is still coasting would carry the view back to the top.
+                        scroll_w.set_kinetic_scrolling(false);
+                        gtk::glib::timeout_add_local_once(Duration::from_millis(150), {
+                            let scroll_w = scroll_w.clone();
+                            move || scroll_w.set_kinetic_scrolling(true)
+                        });
+                    }
                     if prepended {
                         gtk::glib::timeout_add_local_once(Duration::from_millis(800), {
                             let prepend = prepend.clone();
@@ -1071,6 +1090,7 @@ pub fn build() -> Page {
     {
         let (older, current, load_msgs, prepend, adj) =
             (older.clone(), current.clone(), load_msgs.clone(), prepend.clone(), msg_scroll.vadjustment());
+        let (msgs_m, anchor_m) = (msgs.clone(), anchor.clone());
         *more_cell.borrow_mut() = Some(Rc::new(move || {
             let Some(cid) = current.borrow().clone() else { return };
             let next = {
@@ -1082,18 +1102,26 @@ pub fn build() -> Page {
                 o.loading = true;
                 n
             };
+            // Anchor to a message on screen before the request goes out.
+            record_anchor(&msgs_m, &adj, &anchor_m);
             let path = next.strip_prefix(graph::BASE).unwrap_or(&next).to_string();
             let (older, load_msgs, prepend, adj) = (older.clone(), load_msgs.clone(), prepend.clone(), adj.clone());
             util::run(
                 move || graph::get(&path),
                 move |r| {
                     let mut o = older.borrow_mut();
-                    o.loading = false;
                     if o.chat != cid {
+                        o.loading = false;
                         return;
                     }
                     match r {
                         Ok(v) => {
+                            // `loading` stays set until the page is drawn (cleared in load_msgs), so
+                            // the anchor taken at request time is kept; this is only a safety net.
+                            let older_t = older.clone();
+                            gtk::glib::timeout_add_local_once(Duration::from_secs(8), move || {
+                                older_t.borrow_mut().loading = false;
+                            });
                             let page = v["value"].as_array().cloned().unwrap_or_default();
                             let have: HashSet<String> =
                                 o.msgs.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
@@ -1106,6 +1134,7 @@ pub fn build() -> Page {
                             load_msgs();
                         }
                         Err(e) => {
+                            o.loading = false;
                             drop(o);
                             util::toast(&format!("Could not load older messages: {e}"));
                         }
