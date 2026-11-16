@@ -670,6 +670,7 @@ pub fn build() -> Page {
     show_hidden.set_margin_start(6);
     show_hidden.set_margin_end(6);
     show_hidden.set_margin_top(4);
+    show_hidden.set_margin_bottom(4);
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Find a person to chat with…"));
     search.set_margin_start(6);
@@ -693,8 +694,8 @@ pub fn build() -> Page {
     left.append(&find_btn);
     left.append(&search);
     left.append(&results_scroll);
-    left.append(&show_hidden);
     left.append(&util::pane(&chats));
+    left.append(&show_hidden);
     left.set_size_request(260, -1);
     paned.set_start_child(Some(&left));
     paned.set_end_child(Some(&right));
