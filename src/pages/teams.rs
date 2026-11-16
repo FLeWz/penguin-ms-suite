@@ -694,8 +694,11 @@ pub fn build() -> Page {
     left.append(&find_btn);
     left.append(&search);
     left.append(&results_scroll);
-    left.append(&util::pane(&chats));
-    left.append(&show_hidden);
+    // Last thing in the scrolled content: follows the end of the list instead of being pinned.
+    let list_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list_col.append(&chats);
+    list_col.append(&show_hidden);
+    left.append(&util::pane(&list_col));
     left.set_size_request(260, -1);
     paned.set_start_child(Some(&left));
     paned.set_end_child(Some(&right));
