@@ -4,7 +4,7 @@
 //! Privacy and safety: every previewed link is requested from this machine, so the
 //! linked site sees your IP. Only http(s) is fetched; localhost, private and link-local
 //! addresses are refused (also for redirects); Microsoft sign-in-gated hosts are skipped;
-//! responses are capped at 400 KB. Set `PENGUIN_MS_LINK_PREVIEWS=0` to turn previews off.
+//! responses are capped at 400 KB. Off by default; set `PENGUIN_MS_LINK_PREVIEWS=1` to turn previews on.
 use crate::util;
 use adw::prelude::*;
 use gtk::gdk;
@@ -340,7 +340,7 @@ pub struct Links {
 
 impl Links {
     pub fn new() -> Rc<Self> {
-        let enabled = std::env::var("PENGUIN_MS_LINK_PREVIEWS").map_or(true, |v| v != "0");
+        let enabled = std::env::var("PENGUIN_MS_LINK_PREVIEWS").is_ok_and(|v| v == "1");
         Rc::new(Links { enabled, previews: Default::default(), textures: Default::default(), inflight: Default::default(), on_resize: Default::default() })
     }
 

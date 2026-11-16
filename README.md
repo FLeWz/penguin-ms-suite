@@ -5,7 +5,7 @@ Thin sidebar: Outlook, Teams, Calendar, Excel. Data via Microsoft Graph.
 
 ## Features
 - Outlook: inbox (latest 50), read message bodies.
-- Teams: chat list, read/send messages, emoji picker, link previews, send attachments (attach button, drag and drop, or paste files and images; small images go inline, other files upload to OneDrive and are shared with the chat members only), photo and video previews (click a photo for full size; videos download to `~/.cache/penguin-ms-suite/media`, pruned after 7 days, and play in-app or in the default player).
+- Teams: chat list, read/send messages, emoji picker, link previews (off by default: start with `PENGUIN_MS_LINK_PREVIEWS=1`), send attachments (attach button, drag and drop, or paste files and images; small images go inline, other files upload to OneDrive and are shared with the chat members only), photo and video previews (click a photo for full size; videos download to `~/.cache/penguin-ms-suite/media`, pruned after 7 days, and play in-app or in the default player).
 - Calendar: month picker, events for selected day (local time).
 - Excel: .xlsx files from OneDrive, pick sheet, view used range (first 100 rows x 26 cols). Read-only.
 
