@@ -156,6 +156,128 @@ fn items(m: &Value) -> Vec<Item> {
     out
 }
 
+/// What the context menu and forwarding need to know about one attachment.
+#[derive(Clone)]
+pub struct Attachment {
+    pub name: String,
+    /// Graph path that returns the bytes.
+    pub api: String,
+    /// Local copy location (used if already downloaded).
+    pub cache: PathBuf,
+}
+
+pub type ForwardFn = Rc<dyn Fn(&gtk::Widget, Attachment)>;
+
+impl Item {
+    fn attachment(&self) -> Attachment {
+        Attachment { name: self.name.clone(), api: self.api_path(), cache: self.cache_path() }
+    }
+}
+
+/// Download into the cache unless it is already there. Blocking: call from a worker thread.
+pub fn fetch_to_cache(a: &Attachment) -> Result<(), String> {
+    if a.cache.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(a.cache.parent().unwrap_or(&a.cache)).map_err(|e| e.to_string())?;
+    graph::download(&a.api, &a.cache, MAX_VIDEO_BYTES)
+}
+
+/// Open with the default app: download to the cache first when needed.
+fn open_cached(a: Attachment) {
+    util::toast(&format!("Opening {}…", a.name));
+    util::run(
+        move || fetch_to_cache(&a).map(|_| a.cache),
+        |r| match r {
+            Ok(p) => open_external(&p),
+            Err(e) => util::toast(&format!("Could not open: {e}")),
+        },
+    );
+}
+
+fn save_as(w: &gtk::Widget, a: Attachment) {
+    let parent = w.root().and_downcast::<gtk::Window>();
+    glib::spawn_future_local(async move {
+        let dlg = gtk::FileDialog::builder().title("Save attachment").initial_name(&a.name).build();
+        let Ok(file) = dlg.save_future(parent.as_ref()).await else { return };
+        let Some(dest) = file.path() else {
+            return util::toast("Choose a local folder");
+        };
+        util::toast(&format!("Saving {}…", a.name));
+        let name = a.name.clone();
+        util::run(
+            move || {
+                if a.cache.exists() {
+                    std::fs::copy(&a.cache, &dest).map(|_| ()).map_err(|e| e.to_string())
+                } else {
+                    graph::download(&a.api, &dest, MAX_VIDEO_BYTES)
+                }
+            },
+            move |r| match r {
+                Ok(()) => util::toast(&format!("Saved {name}")),
+                Err(e) => util::toast(&format!("Could not save {name}: {e}")),
+            },
+        );
+    });
+}
+
+/// Right-click menu (Open / Save as… / Forward…) at the pointer for an attachment widget.
+fn attach_menu(w: &gtk::Widget, a: Attachment, open: Rc<dyn Fn()>, fwd: Rc<RefCell<Option<ForwardFn>>>) {
+    let pop = gtk::Popover::new();
+    pop.set_parent(w);
+    pop.set_has_arrow(false);
+    pop.set_halign(gtk::Align::Start);
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let entry = |label: &str, cb: Rc<dyn Fn()>| {
+        let b = gtk::Button::with_label(label);
+        b.add_css_class("flat");
+        if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+            l.set_xalign(0.0);
+        }
+        let pop = pop.clone();
+        b.connect_clicked(move |_| {
+            pop.popdown();
+            cb();
+        });
+        b
+    };
+    col.append(&entry("Open", open));
+    let (w_save, a_save) = (w.downgrade(), a.clone());
+    col.append(&entry(
+        "Save as…",
+        Rc::new(move || {
+            if let Some(w) = w_save.upgrade() {
+                save_as(&w, a_save.clone());
+            }
+        }),
+    ));
+    let w_fwd = w.downgrade();
+    col.append(&entry(
+        "Forward…",
+        Rc::new(move || {
+            let f = fwd.borrow().clone();
+            match (f, w_fwd.upgrade()) {
+                (Some(f), Some(w)) => f(&w, a.clone()),
+                _ => util::toast("Forwarding is not available here"),
+            }
+        }),
+    ));
+    pop.set_child(Some(&col));
+    let rc = gtk::GestureClick::new();
+    rc.set_button(3);
+    rc.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let pop = pop.clone();
+        rc.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            pop.popup();
+        });
+    }
+    w.add_controller(rc);
+    w.connect_destroy(move |_| pop.unparent());
+}
+
 fn open_external(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
@@ -180,6 +302,7 @@ pub struct Media {
     failed: RefCell<HashMap<String, String>>,
     scroll: RefCell<Option<gtk::ScrolledWindow>>,
     kick_queued: std::cell::Cell<bool>,
+    forward: Rc<RefCell<Option<ForwardFn>>>,
 }
 
 impl Media {
@@ -194,7 +317,13 @@ impl Media {
             failed: Default::default(),
             scroll: Default::default(),
             kick_queued: Default::default(),
+            forward: Default::default(),
         })
+    }
+
+    /// Handler for the "Forward…" menu entry (owner shows a chat chooser and sends).
+    pub fn set_forward(&self, f: ForwardFn) {
+        *self.forward.borrow_mut() = Some(f);
     }
 
     /// Preview widgets for the message's photos and videos (empty if none).
@@ -204,7 +333,7 @@ impl Media {
             .map(|it| match it.kind {
                 Kind::Image => self.image_widget(it),
                 Kind::Video => self.video_widget(it),
-                Kind::File => file_widget(it),
+                Kind::File => file_widget(it, self.forward.clone()),
             })
             .collect()
     }
@@ -329,6 +458,20 @@ impl Media {
         let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
         holder.set_halign(gtk::Align::Start);
         let key = it.key();
+        {
+            let (me, key, it2) = (self.clone(), key.clone(), it.clone());
+            let hw = holder.downgrade();
+            let open: Rc<dyn Fn()> = Rc::new(move || {
+                let tex = me.textures.borrow().get(&key).cloned();
+                match (tex, hw.upgrade()) {
+                    (Some(t), Some(h)) => {
+                        open_image(h.root().and_downcast::<gtk::Window>().as_ref(), &t, &it2.name)
+                    }
+                    _ => open_cached(it2.attachment()),
+                }
+            });
+            attach_menu(holder.upcast_ref(), it.attachment(), open, self.forward.clone());
+        }
         if let Some(t) = self.textures.borrow().get(&key).cloned() {
             show_image(&holder, &t, &it.name, false);
             return holder.upcast();
@@ -359,6 +502,15 @@ impl Media {
         l.set_max_width_chars(40);
         row.append(&l);
         b.set_child(Some(&row));
+        {
+            let bw = b.downgrade();
+            let open: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(b) = bw.upgrade() {
+                    b.emit_clicked();
+                }
+            });
+            attach_menu(b.upcast_ref(), it.attachment(), open, self.forward.clone());
+        }
         let me = self.clone();
         b.connect_clicked(move |btn| {
             let path = it.cache_path();
@@ -395,7 +547,7 @@ impl Media {
 }
 
 /// Card for a non-media file attachment; click opens its link in the browser.
-fn file_widget(it: Item) -> gtk::Widget {
+fn file_widget(it: Item, fwd: Rc<RefCell<Option<ForwardFn>>>) -> gtk::Widget {
     let b = gtk::Button::new();
     b.add_css_class("flat");
     b.add_css_class("quiet-icon");
@@ -408,6 +560,13 @@ fn file_widget(it: Item) -> gtk::Widget {
     row.append(&l);
     b.set_child(Some(&row));
     b.set_tooltip_text(Some(&it.url));
+    {
+        let url = it.url.clone();
+        let open: Rc<dyn Fn()> = Rc::new(move || {
+            let _ = gtk::gio::AppInfo::launch_default_for_uri(&url, None::<&gtk::gio::AppLaunchContext>);
+        });
+        attach_menu(b.upcast_ref(), it.attachment(), open, fwd);
+    }
     b.connect_clicked(move |_| {
         let _ = gtk::gio::AppInfo::launch_default_for_uri(&it.url, None::<&gtk::gio::AppLaunchContext>);
     });
@@ -415,8 +574,13 @@ fn file_widget(it: Item) -> gtk::Widget {
 }
 
 fn clear(b: &gtk::Box) {
-    while let Some(c) = b.first_child() {
-        b.remove(&c);
+    // Keep popovers (the right-click menu is parented to the holder).
+    let mut child = b.first_child();
+    while let Some(c) = child {
+        child = c.next_sibling();
+        if !c.is::<gtk::Popover>() {
+            b.remove(&c);
+        }
     }
 }
 

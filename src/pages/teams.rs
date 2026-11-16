@@ -114,6 +114,83 @@ fn chat_info(title: &str, preview: &str, unread: bool) -> gtk::Box {
 }
 
 /// Popover with the favourite and hide actions for one chat.
+/// "Forward…" chooser: pick a chat, then download the attachment (if needed) and send it there.
+fn forward_dialog(
+    from: &gtk::Widget,
+    att: media::Attachment,
+    titles: &HashMap<String, String>,
+    members: Rc<RefCell<HashMap<String, Vec<String>>>>,
+) {
+    let mut chats: Vec<(String, String)> = titles.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    chats.sort_by_key(|(_, t)| t.to_lowercase());
+    let win = gtk::Window::builder()
+        .title(format!("Forward {}", att.name))
+        .modal(true)
+        .default_width(360)
+        .default_height(480)
+        .build();
+    if let Some(parent) = from.root().and_downcast::<gtk::Window>() {
+        win.set_transient_for(Some(&parent));
+    }
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    col.set_margin_top(8);
+    col.set_margin_bottom(8);
+    col.set_margin_start(8);
+    col.set_margin_end(8);
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Send to…"));
+    col.append(&search);
+    let list = gtk::ListBox::new();
+    list.add_css_class("navigation-sidebar");
+    for (_, t) in &chats {
+        let l = gtk::Label::new(Some(t));
+        l.set_xalign(0.0);
+        l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        l.set_margin_top(6);
+        l.set_margin_bottom(6);
+        l.set_margin_start(6);
+        list.append(&l);
+    }
+    let lowered: Rc<Vec<String>> = Rc::new(chats.iter().map(|(_, t)| t.to_lowercase()).collect());
+    {
+        let (search, lowered) = (search.clone(), lowered.clone());
+        list.set_filter_func(move |row| {
+            let q = search.text().to_lowercase();
+            q.is_empty() || lowered.get(row.index() as usize).is_some_and(|t| t.contains(&q))
+        });
+    }
+    {
+        let list = list.clone();
+        search.connect_search_changed(move |_| list.invalidate_filter());
+    }
+    {
+        let (win, chats) = (win.clone(), Rc::new(chats));
+        list.connect_row_activated(move |_, row| {
+            let Some((id, title)) = chats.get(row.index() as usize).cloned() else { return };
+            win.close();
+            util::toast(&format!("Forwarding {} to {title}…", att.name));
+            let recipients = members.borrow().get(&id).cloned().unwrap_or_default();
+            let att = att.clone();
+            util::run(
+                move || {
+                    media::fetch_to_cache(&att)?;
+                    let size = std::fs::metadata(&att.cache).map_err(|e| e.to_string())?.len();
+                    let f = attach::Staged { name: att.name.clone(), src: attach::Src::Path(att.cache.clone()), size };
+                    attach::send(&id, "", &[f], &recipients)
+                },
+                move |r| match r {
+                    Ok(()) => util::toast(&format!("Forwarded to {title}")),
+                    Err(e) => util::toast(&format!("Could not forward: {e}")),
+                },
+            );
+        });
+    }
+    col.append(&util::pane(&list));
+    win.set_child(Some(&col));
+    win.present();
+    search.grab_focus();
+}
+
 fn menu_popover(
     is_fav: bool,
     is_hidden: bool,
@@ -527,6 +604,10 @@ pub fn build() -> Page {
     let chat_members: Rc<RefCell<HashMap<String, Vec<String>>>> = Default::default();
     // ids of one-on-one chats: their bubbles need no sender name
     let one_on_one: Rc<RefCell<HashSet<String>>> = Default::default();
+    {
+        let (titles, members) = (titles.clone(), chat_members.clone());
+        media.set_forward(Rc::new(move |w, att| forward_dialog(w, att, &titles.borrow(), members.clone())));
+    }
     // "Jump to newest" button, shown while scrolled up. Animates to the bottom and turns
     // follow mode back on.
     let jump_btn = gtk::Button::from_icon_name("go-down-symbolic");
