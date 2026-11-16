@@ -21,6 +21,10 @@ const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 1024 * 1024 * 1024;
 const THUMB_W: f64 = 320.0;
 const THUMB_H: f64 = 240.0;
+// Bubbles keep only a thumbnail decoded at up to this size (2x the displayed size, for
+// HiDPI); the original stays on disk and is decoded when the viewer opens it.
+const DECODE_W: i32 = 640;
+const DECODE_H: i32 = 480;
 const MAX_TEXTURES: usize = 40; // decoded images are large; keep the cache small
 const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -278,13 +282,44 @@ fn attach_menu(w: &gtk::Widget, a: Attachment, open: Rc<dyn Fn()>, fwd: Rc<RefCe
     w.connect_destroy(move |_| pop.unparent());
 }
 
+/// Thumbnail-sized texture from an image file. The decoder scales while loading, so a large
+/// photo never exists in memory at full size. None when no pixbuf loader handles the format.
+fn decode_thumb(path: &std::path::Path) -> Option<gdk::Texture> {
+    let (_, w, h) = gtk::gdk_pixbuf::Pixbuf::file_info(path)?;
+    let s = (DECODE_W as f64 / w as f64).min(DECODE_H as f64 / h as f64).min(1.0);
+    let (tw, th) = (((w as f64 * s).round() as i32).max(1), ((h as f64 * s).round() as i32).max(1));
+    let pb = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, tw, th, true).ok()?;
+    let format = if pb.has_alpha() { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
+    Some(
+        gdk::MemoryTexture::new(pb.width(), pb.height(), format, &pb.read_pixel_bytes(), pb.rowstride() as usize)
+            .upcast(),
+    )
+}
+
+/// Texture from encoded image bytes, scaled down to fit `maxw` x `maxh` while decoding
+/// (never enlarged). None if no pixbuf loader handles the format.
+pub(crate) fn decode_scaled(bytes: &[u8], maxw: i32, maxh: i32) -> Option<gdk::Texture> {
+    let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+    loader.connect_size_prepared(move |l, w, h| {
+        let s = (maxw as f64 / w as f64).min(maxh as f64 / h as f64).min(1.0);
+        if s < 1.0 {
+            l.set_size(((w as f64 * s).round() as i32).max(1), ((h as f64 * s).round() as i32).max(1));
+        }
+    });
+    let ok = loader.write(bytes).is_ok();
+    let closed = loader.close().is_ok();
+    let pb = loader.pixbuf().filter(|_| ok && closed)?;
+    let format = if pb.has_alpha() { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
+    Some(gdk::MemoryTexture::new(pb.width(), pb.height(), format, &pb.read_pixel_bytes(), pb.rowstride() as usize).upcast())
+}
+
 fn open_external(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
 /// Decoded textures are immutable and GDK documents them as usable from any thread; this
 /// only lets a finished decode travel back from the worker thread.
-struct SendTexture(gdk::Texture);
+pub(crate) struct SendTexture(pub(crate) gdk::Texture);
 // SAFETY: GdkTexture is immutable and thread-safe; it is only used on the main thread afterwards.
 unsafe impl Send for SendTexture {}
 
@@ -418,10 +453,20 @@ impl Media {
             h.append(&spin);
         }
         let (me, key, path, name) = (self.clone(), key.to_string(), it.api_path(), it.name.clone());
+        let file = it.cache_path();
+        let it_file = file.clone();
         util::run(
             // Fetch and decode off the UI thread so big photos do not stall scrolling.
             move || {
                 let bytes = graph::get_bytes(&path, MAX_IMAGE_BYTES)?;
+                // Keep the original on disk (for the viewer) and decode only a thumbnail.
+                let on_disk = std::fs::create_dir_all(file.parent().unwrap_or(&file)).is_ok()
+                    && std::fs::write(&file, &bytes).is_ok();
+                if on_disk {
+                    if let Some(t) = decode_thumb(&file) {
+                        return Ok(SendTexture(t));
+                    }
+                }
                 gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
                     .map(SendTexture)
                     .map_err(|e| e.to_string())
@@ -430,6 +475,7 @@ impl Media {
                 me.loading.borrow_mut().remove(&key);
                 me.wanted.borrow_mut().remove(&key);
                 let holders = me.waiting.borrow_mut().remove(&key).unwrap_or_default();
+                let file2 = it_file;
                 match r {
                     Ok(SendTexture(t)) => {
                         let mut c = me.textures.borrow_mut();
@@ -439,7 +485,7 @@ impl Media {
                         c.insert(key.clone(), t.clone());
                         drop(c);
                         for h in holders.iter().filter_map(|h| h.upgrade()) {
-                            show_image(&h, &t, &name, true);
+                            show_image(&h, &t, &name, &file2, true);
                         }
                     }
                     Err(e) => {
@@ -465,7 +511,7 @@ impl Media {
                 let tex = me.textures.borrow().get(&key).cloned();
                 match (tex, hw.upgrade()) {
                     (Some(t), Some(h)) => {
-                        open_image(h.root().and_downcast::<gtk::Window>().as_ref(), &t, &it2.name)
+                        open_image(h.root().and_downcast::<gtk::Window>().as_ref(), &t, &it2.name, &it2.cache_path())
                     }
                     _ => open_cached(it2.attachment()),
                 }
@@ -473,7 +519,7 @@ impl Media {
             attach_menu(holder.upcast_ref(), it.attachment(), open, self.forward.clone());
         }
         if let Some(t) = self.textures.borrow().get(&key).cloned() {
-            show_image(&holder, &t, &it.name, false);
+            show_image(&holder, &t, &it.name, &it.cache_path(), false);
             return holder.upcast();
         }
         if let Some(e) = self.failed.borrow().get(&key) {
@@ -602,7 +648,7 @@ fn show_error(holder: &gtk::Box, e: &str) {
 }
 
 /// Scaled thumbnail in the bubble; click opens the full-size viewer. `fade`: fade it in.
-fn show_image(holder: &gtk::Box, tex: &gdk::Texture, name: &str, fade: bool) {
+fn show_image(holder: &gtk::Box, tex: &gdk::Texture, name: &str, full: &std::path::Path, fade: bool) {
     clear(holder);
     holder.remove_css_class("thumb-placeholder");
     let (pw, ph) = fit((tex.width() as f64, tex.height() as f64));
@@ -620,11 +666,11 @@ fn show_image(holder: &gtk::Box, tex: &gdk::Texture, name: &str, fade: bool) {
         glib::idle_add_local_once(move || p.set_opacity(1.0));
     }
     let click = gtk::GestureClick::new();
-    let (tex, name) = (tex.clone(), name.to_string());
+    let (tex, name, full) = (tex.clone(), name.to_string(), full.to_path_buf());
     let holder_w = holder.downgrade();
     click.connect_released(move |_, _, _, _| {
         let parent = holder_w.upgrade().and_then(|h| h.root()).and_downcast::<gtk::Window>();
-        open_image(parent.as_ref(), &tex, &name);
+        open_image(parent.as_ref(), &tex, &name, &full);
     });
     pic.add_controller(click);
     holder.append(&pic);
@@ -647,7 +693,23 @@ fn viewer(parent: Option<&gtk::Window>, title: &str) -> gtk::Window {
     w
 }
 
-fn open_image(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str) {
+/// Open the viewer. The bubble only holds a thumbnail, so decode the original from the
+/// cache file (off the UI thread) and show that; fall back to the thumbnail.
+fn open_image(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str, full: &std::path::Path) {
+    if !full.exists() {
+        return show_viewer(parent, tex, name);
+    }
+    let (parent, tex, name, path) = (parent.cloned(), tex.clone(), name.to_string(), full.to_path_buf());
+    util::run(
+        move || gdk::Texture::from_filename(&path).ok().map(SendTexture),
+        move |r| match r {
+            Some(SendTexture(full)) => show_viewer(parent.as_ref(), &full, &name),
+            None => show_viewer(parent.as_ref(), &tex, &name),
+        },
+    );
+}
+
+fn show_viewer(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str) {
     if super::lightbox::show_image(tex, name) {
         return;
     }

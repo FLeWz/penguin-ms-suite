@@ -7,7 +7,7 @@
 //! responses are capped at 400 KB. Set `PENGUIN_MS_LINK_PREVIEWS=0` to turn previews off.
 use crate::util;
 use adw::prelude::*;
-use gtk::{gdk, glib};
+use gtk::gdk;
 use serde_json::Value;
 use std::{
     cell::RefCell,
@@ -362,7 +362,16 @@ impl Links {
                         if self.inflight.borrow_mut().insert(url.clone()) {
                             let (me, weak, u) = (self.clone(), holder.downgrade(), url.clone());
                             util::run(
-                                move || fetch_preview(&u).map(|(p, img)| (p, img)),
+                                // Fetch and decode (scaled to card size) off the UI thread.
+                                move || {
+                                    fetch_preview(&u).map(|(p, img)| {
+                                        let (w, h) = if p.video { (320, 180) } else { (192, 192) };
+                                        let tex = img
+                                            .and_then(|b| super::media::decode_scaled(&b, w, h))
+                                            .map(super::media::SendTexture);
+                                        (p, tex)
+                                    })
+                                },
                                 move |r| {
                                     me.inflight.borrow_mut().remove(&url);
                                     let Some((p, img)) = r else {
@@ -373,14 +382,12 @@ impl Links {
                                         }
                                         return;
                                     };
-                                    if let (Some(src), Some(bytes)) = (p.image.clone(), img) {
-                                        if let Ok(t) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
-                                            let mut c = me.textures.borrow_mut();
-                                            if c.len() >= MAX_TEXTURES {
-                                                c.clear();
-                                            }
-                                            c.insert(src, t);
+                                    if let (Some(src), Some(super::media::SendTexture(t))) = (p.image.clone(), img) {
+                                        let mut c = me.textures.borrow_mut();
+                                        if c.len() >= MAX_TEXTURES {
+                                            c.clear();
                                         }
+                                        c.insert(src, t);
                                     }
                                     me.previews.borrow_mut().insert(url.clone(), Some(p.clone()));
                                     if let Some(h) = weak.upgrade() {
