@@ -196,6 +196,7 @@ fn menu_popover(
     is_hidden: bool,
     on_fav: Rc<dyn Fn()>,
     on_hide: Rc<dyn Fn()>,
+    on_delete: Rc<dyn Fn()>,
 ) -> gtk::Popover {
     let pop = gtk::Popover::new();
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -214,6 +215,8 @@ fn menu_popover(
     };
     col.append(&item(if is_fav { "Remove from favourites" } else { "Add to favourites" }, on_fav));
     col.append(&item(if is_hidden { "Unhide chat" } else { "Hide chat" }, on_hide));
+    col.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    col.append(&item("Delete chat…", on_delete));
     pop.set_child(Some(&col));
     pop
 }
@@ -1056,6 +1059,7 @@ pub fn build() -> Page {
                         let ok = d.chat == cid
                             && n > 0
                             && jump.borrow().is_none()
+                            && msgs.first_child().is_some() // the list may have been cleared
                             && d.ids.iter().all(|i| !i.is_empty());
                         ok.then(|| entries.iter().position(|e| e.0 == d.ids[0]))
                             .flatten()
@@ -1281,7 +1285,13 @@ pub fn build() -> Page {
     let read_local: Rc<RefCell<HashMap<String, String>>> = Default::default();
     let fresh: Rc<RefCell<HashSet<String>>> = Default::default();
 
+    // Chats deleted this session -> id of their last message then. They stay out of the list
+    // until a newer message arrives (the server brings a hidden chat back the same way).
+    let deleted: Rc<RefCell<HashMap<String, String>>> = Default::default();
+
     let render: Rc<dyn Fn()> = {
+        let msgs_r = msgs.clone();
+        let deleted_r = deleted.clone();
         let (chats, ids, current, quiet, cache, prefs, render_cell, show_hidden, titles) = (
             chats.clone(), ids.clone(), current.clone(), quiet.clone(), cache.clone(),
             prefs.clone(), render_cell.clone(), show_hidden.clone(), titles.clone(),
@@ -1291,6 +1301,17 @@ pub fn build() -> Page {
         let one_c = one_on_one.clone();
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
+            let items: Vec<Value> = {
+                let d = deleted_r.borrow();
+                items
+                    .into_iter()
+                    .filter(|c| {
+                        let id = c["id"].as_str().unwrap_or("");
+                        let last = c["lastMessagePreview"]["id"].as_str().unwrap_or("");
+                        d.get(id).is_none_or(|at| at != last)
+                    })
+                    .collect()
+            };
             {
                 let mut m = members_c.borrow_mut();
                 for c in &items {
@@ -1391,13 +1412,68 @@ pub fn build() -> Page {
                             }
                         })
                     };
+                    // Delete = hide the chat for me on the server (a user cannot delete a chat for
+                    // everyone: that needs a tenant admin), after a confirmation.
+                    let on_delete: Rc<dyn Fn()> = {
+                        let title = chat_title(c, &my_id);
+                        let pid = c["lastMessagePreview"]["id"].as_str().unwrap_or("").to_string();
+                        let (cid, my, deleted, render_cell, current, msgs_d) =
+                            (cid.clone(), my_id.clone(), deleted_r.clone(), render_cell.clone(), current.clone(), msgs_r.clone());
+                        let line_w = line.downgrade();
+                        Rc::new(move || {
+                            let parent = line_w.upgrade().and_then(|l| l.root()).and_downcast::<gtk::Window>();
+                            let (title, pid, cid, my, deleted, render_cell, current, msgs_d) = (
+                                title.clone(), pid.clone(), cid.clone(), my.clone(), deleted.clone(),
+                                render_cell.clone(), current.clone(), msgs_d.clone(),
+                            );
+                            gtk::glib::spawn_future_local(async move {
+                                let dlg = gtk::AlertDialog::builder()
+                                    .message(format!("Delete \u{201c}{title}\u{201d}?"))
+                                    .detail(
+                                        "The chat is removed from your list. Other people keep it, and it \
+                                         comes back if someone writes in it again. Deleting a chat for \
+                                         everyone needs a tenant admin.",
+                                    )
+                                    .buttons(["Cancel", "Delete"])
+                                    .cancel_button(0)
+                                    .default_button(0)
+                                    .build();
+                                if dlg.choose_future(parent.as_ref()).await != Ok(1) {
+                                    return;
+                                }
+                                let Ok((_, tenant)) = crate::auth::config() else {
+                                    return util::toast("Could not read the tenant id");
+                                };
+                                let body = json!({"user": {"id": my, "tenantId": tenant}});
+                                let cid2 = cid.clone();
+                                util::run(
+                                    move || graph::post(&format!("/chats/{cid2}/hideForUser"), &body),
+                                    move |r| match r {
+                                        Ok(_) => {
+                                            deleted.borrow_mut().insert(cid.clone(), pid);
+                                            if current.borrow().as_deref() == Some(cid.as_str()) {
+                                                *current.borrow_mut() = None;
+                                                util::clear(&msgs_d);
+                                            }
+                                            util::toast("Chat deleted from your list");
+                                            let f = render_cell.borrow().clone();
+                                            if let Some(f) = f {
+                                                gtk::glib::idle_add_local_once(move || f());
+                                            }
+                                        }
+                                        Err(e) => util::toast(&format!("Could not delete chat: {e}")),
+                                    },
+                                );
+                            });
+                        })
+                    };
                     let (t1, t2) = (toggle.clone(), toggle);
                     let fav_cb: Rc<dyn Fn()> = Rc::new(move || t1(true));
                     let hide_cb: Rc<dyn Fn()> = Rc::new(move || t2(false));
-                    let menu = chat_menu(&menu_popover(is_fav, is_hidden, fav_cb.clone(), hide_cb.clone()));
+                    let menu = chat_menu(&menu_popover(is_fav, is_hidden, fav_cb.clone(), hide_cb.clone(), on_delete.clone()));
                     line.append(&menu);
                     // Right click: the same menu, opened at the pointer.
-                    let ctx = menu_popover(is_fav, is_hidden, fav_cb, hide_cb);
+                    let ctx = menu_popover(is_fav, is_hidden, fav_cb, hide_cb, on_delete);
                     ctx.set_parent(&line);
                     ctx.set_has_arrow(false);
                     ctx.set_halign(gtk::Align::Start);
