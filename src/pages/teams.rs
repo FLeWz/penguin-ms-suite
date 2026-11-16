@@ -123,7 +123,24 @@ pub fn build() -> Page {
     show_hidden.set_margin_start(6);
     show_hidden.set_margin_end(6);
     show_hidden.set_margin_top(4);
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Find a person to chat with…"));
+    search.set_margin_start(6);
+    search.set_margin_end(6);
+    search.set_margin_top(6);
+    let results = gtk::ListBox::new();
+    results.add_css_class("navigation-sidebar");
+    results.set_selection_mode(gtk::SelectionMode::None);
+    let results_scroll = gtk::ScrolledWindow::builder()
+        .child(&results)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(220)
+        .propagate_natural_height(true)
+        .visible(false)
+        .build();
     let left = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    left.append(&search);
+    left.append(&results_scroll);
     left.append(&show_hidden);
     left.append(&util::pane(&chats));
     left.set_size_request(260, -1);
@@ -212,6 +229,9 @@ pub fn build() -> Page {
     let signature: Rc<RefCell<String>> = Default::default();
     let cache: Rc<RefCell<(String, Vec<Value>)>> = Default::default(); // (my id, chats)
     let prefs = Rc::new(RefCell::new(Prefs::load()));
+    // Chats just created from search: they have no messages yet, so the chat
+    // list API may not return them. Kept until the server lists them.
+    let pending: Rc<RefCell<Vec<Value>>> = Default::default();
     // Lets row buttons re-render the list (render refers to itself through this cell).
     let render_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
 
@@ -308,11 +328,13 @@ pub fn build() -> Page {
     }
 
     let do_refresh: Rc<dyn Fn(bool)> = {
+        let pending_c = pending.clone();
         let (chats, current, load_msgs, seen, me, signature, cache, prefs, render) = (
             chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
             signature.clone(), cache.clone(), prefs.clone(), render.clone(),
         );
         Rc::new(move |polling: bool| {
+            let pending = pending_c.clone();
             let (chats, current, load_msgs, seen, me2, signature, cache, prefs, render) = (
                 chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
                 signature.clone(), cache.clone(), prefs.clone(), render.clone(),
@@ -339,7 +361,14 @@ pub fn build() -> Page {
                         }
                     };
                     *me2.borrow_mut() = my_id.clone();
-                    let items = v["value"].as_array().cloned().unwrap_or_default();
+                    let mut items = v["value"].as_array().cloned().unwrap_or_default();
+                    {
+                        let mut pend = pending.borrow_mut();
+                        pend.retain(|p| !items.iter().any(|c| c["id"] == p["id"]));
+                        for p in pend.iter() {
+                            items.insert(0, p.clone());
+                        }
+                    }
 
                     // New-message detection.
                     let first_load = seen.borrow().is_empty();
@@ -401,6 +430,130 @@ pub fn build() -> Page {
             );
         })
     };
+
+    // People search: type a name, pick a result, a 1:1 chat is created (or reused).
+    let found: Rc<RefCell<Vec<Value>>> = Default::default();
+    let generation = Rc::new(std::cell::Cell::new(0u32));
+    {
+        let (results, results_scroll, found, generation, me) = (
+            results.clone(), results_scroll.clone(), found.clone(), generation.clone(), me.clone(),
+        );
+        search.connect_search_changed(move |e| {
+            let q = e.text().trim().to_string();
+            generation.set(generation.get() + 1);
+            let g = generation.get();
+            if q.chars().count() < 2 {
+                util::clear(&results);
+                results_scroll.set_visible(false);
+                return;
+            }
+            let (results, results_scroll, found, generation, me) = (
+                results.clone(), results_scroll.clone(), found.clone(), generation.clone(), me.clone(),
+            );
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                if generation.get() != g {
+                    return; // typed more since; a newer search is coming
+                }
+                let lit = q.replace('\'', "''");
+                let path = format!(
+                    "/users?$filter={}&$top=10&$select=id,displayName,mail",
+                    graph::enc(&format!(
+                        "startswith(displayName,'{lit}') or startswith(mail,'{lit}') or startswith(surname,'{lit}')"
+                    ))
+                );
+                util::run(
+                    move || graph::get(&path),
+                    move |r| {
+                        if generation.get() != g {
+                            return;
+                        }
+                        let v = match r {
+                            Ok(v) => v,
+                            Err(e) => return util::toast(&e),
+                        };
+                        let my_id = me.borrow().clone();
+                        let users: Vec<Value> = v["value"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|u| u["id"].as_str() != Some(my_id.as_str()))
+                            .collect();
+                        util::clear(&results);
+                        if users.is_empty() {
+                            let row = util::row("No people found", "");
+                            results.append(&row);
+                        }
+                        for u in &users {
+                            results.append(&util::row(
+                                u["displayName"].as_str().unwrap_or("?"),
+                                u["mail"].as_str().unwrap_or(""),
+                            ));
+                        }
+                        *found.borrow_mut() = users;
+                        results_scroll.set_visible(true);
+                    },
+                );
+            });
+        });
+    }
+    let results_conn = results.clone();
+    {
+        let (found, me, cache, pending, prefs, current, render, load_msgs, search, results, results_scroll) = (
+            found.clone(), me.clone(), cache.clone(), pending.clone(), prefs.clone(), current.clone(),
+            render.clone(), load_msgs.clone(), search.clone(), results.clone(), results_scroll.clone(),
+        );
+        results_conn.connect_row_activated(move |_, row| {
+            let Some(user) = found.borrow().get(row.index() as usize).cloned() else { return };
+            let uid = user["id"].as_str().unwrap_or("").to_string();
+            let name = user["displayName"].as_str().unwrap_or("").to_string();
+            let my_id = me.borrow().clone();
+            if uid.is_empty() || my_id.is_empty() {
+                return util::toast("Not ready yet, try again in a moment");
+            }
+            let bind = |id: &str| format!("https://graph.microsoft.com/v1.0/users('{id}')");
+            let body = json!({
+                "chatType": "oneOnOne",
+                "members": [
+                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
+                     "roles": ["owner"], "user@odata.bind": bind(&my_id)},
+                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
+                     "roles": ["owner"], "user@odata.bind": bind(&uid)},
+                ]
+            });
+            let (cache, pending, prefs, current, render, load_msgs, search, results, results_scroll) = (
+                cache.clone(), pending.clone(), prefs.clone(), current.clone(), render.clone(),
+                load_msgs.clone(), search.clone(), results.clone(), results_scroll.clone(),
+            );
+            util::run_ok(
+                move || graph::post("/chats", &body),
+                move |c| {
+                    let Some(cid) = c["id"].as_str().map(String::from) else {
+                        return util::toast("Chat created but no id returned");
+                    };
+                    // Graph returns the existing chat if there already is one.
+                    let exists = cache.borrow().1.iter().any(|x| x["id"].as_str() == Some(cid.as_str()));
+                    if !exists {
+                        let chat = json!({
+                            "id": cid, "chatType": "oneOnOne",
+                            "members": [{"userId": uid, "displayName": name}],
+                        });
+                        pending.borrow_mut().push(chat.clone());
+                        cache.borrow_mut().1.insert(0, chat);
+                    }
+                    if prefs.borrow_mut().hidden.remove(&cid) {
+                        prefs.borrow().save();
+                    }
+                    *current.borrow_mut() = Some(cid);
+                    render();
+                    load_msgs();
+                    search.set_text("");
+                    util::clear(&results);
+                    results_scroll.set_visible(false);
+                },
+            );
+        });
+    }
 
     // Live updates: poll every 10 s while the page exists.
     {
