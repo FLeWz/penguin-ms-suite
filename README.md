@@ -58,8 +58,52 @@ Notes:
 - After scopes change, sign out and sign in again: the saved session keeps the old scopes.
 - Used by the app today (read-only): Mail.Read, Calendars.Read, Chat.ReadWrite, Files.Read. The rest are registered for upcoming write features.
 
+## Requirements
+
+Minimum versions: Rust 1.85+ (edition 2024), GTK 4.8+, libadwaita 1.4+.
+
+Build dependencies:
+
+| What | Arch (pacman) | Debian / Ubuntu (apt) |
+|---|---|---|
+| Rust toolchain | `rust` (or `rustup`) | `rustc cargo` (or `rustup`) |
+| C compiler, make (the TLS crate `ring` compiles C) | `base-devel` | `build-essential` |
+| pkg-config | `pkgconf` | `pkg-config` |
+| GTK 4 headers + library | `gtk4` | `libgtk-4-dev` |
+| libadwaita headers + library | `libadwaita` | `libadwaita-1-dev` |
+
+Runtime (besides the libraries above):
+
+| What | Arch | Debian / Ubuntu |
+|---|---|---|
+| `xdg-open`: sign-in page, links, external video player | `xdg-utils` | `xdg-utils` |
+| A notification daemon (desktop notifications for new messages) | provided by your desktop (KDE, GNOME, ...) | same |
+| Video playback in the viewer: container support (mp4, webm) | `gst-plugins-good` | `gstreamer1.0-plugins-good` |
+| Video playback: H.264 (most Teams videos). Optional: without it the app opens the default player instead | `gst-libav` | `gstreamer1.0-libav` |
+
+Install:
+
+    # Arch
+    sudo pacman -S --needed rust base-devel pkgconf gtk4 libadwaita xdg-utils gst-plugins-good gst-libav
+
+    # Debian / Ubuntu
+    sudo apt install rustc cargo build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+        xdg-utils gstreamer1.0-plugins-good gstreamer1.0-libav
+
+Distribution versions:
+- Arch: current packages satisfy everything. Verified on this project's dev machine
+  (gtk4 4.20, libadwaita 1.8, rust 1.92).
+- Debian 13 (trixie) and Ubuntu 24.10+: packages should be new enough (from package
+  metadata, not built there).
+- Ubuntu 24.04: GTK and libadwaita are new enough but the packaged Rust (1.75) is
+  too old. Install Rust with `rustup` instead of `rustc cargo`.
+- Debian 12 and Ubuntu 22.04: libadwaita is older than 1.4, so the app will not build.
+
+The Debian and Ubuntu commands above were not run in this project; package names and
+versions come from the distributions' package lists. If a build fails on missing
+`.pc` files, check with `pkg-config --modversion gtk4 libadwaita-1`.
+
 ## Build / run
-Needs GTK 4.8+ and libadwaita 1.4+ dev packages.
 
     cargo build --release
     ./target/release/penguin-ms-suite
