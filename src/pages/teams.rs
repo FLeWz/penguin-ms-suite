@@ -1,11 +1,13 @@
 use super::{finder, Page};
+use crate::relay;
 use crate::{graph, util};
 use adw::prelude::*;
 use serde_json::{json, Value};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 fn chat_title(c: &Value, me: &str) -> String {
@@ -42,6 +44,12 @@ fn header(text: &str) -> gtk::ListBoxRow {
     r.set_activatable(false);
     r
 }
+
+// Adaptive polling (used while no relay is pushing events).
+const POLL_BACKGROUND: Duration = Duration::from_secs(10); // unfocused, or another app tab shown
+const POLL_FOCUSED: Duration = Duration::from_secs(5); // Teams visible and window focused: chat list
+const POLL_ACTIVE_CHAT: Duration = Duration::from_secs(2); // open chat: newest messages only
+const POLL_SAFETY_NET: Duration = Duration::from_secs(60); // chat list while the relay is healthy
 
 /// Local (per-machine) chat preferences, stored in the app config dir.
 #[derive(Default)]
@@ -125,12 +133,17 @@ pub fn build() -> Page {
     // Message id to bring into view after loading (from the finder), and the rows by id.
     let jump: Rc<RefCell<Option<String>>> = Default::default();
     let rows: Rc<RefCell<HashMap<String, gtk::Widget>>> = Default::default();
+    // Scroll position held across a live reload when the user is reading history.
+    let hold: Rc<Cell<Option<f64>>> = Default::default();
     {
-        let (stick, jump, rows, msgs) = (stick.clone(), jump.clone(), rows.clone(), msgs.clone());
+        let (stick, jump, rows, msgs, hold) =
+            (stick.clone(), jump.clone(), rows.clone(), msgs.clone(), hold.clone());
         msg_scroll.vadjustment().connect_changed(move |a| {
             let target = jump.borrow().clone();
             if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
                 scroll_to(&msgs, a, &w); // keep it in view while labels settle
+            } else if let Some(v) = hold.get() {
+                a.set_value(v); // keep the reading position across a live reload
             } else if stick.get() {
                 a.set_value(a.upper() - a.page_size());
             }
@@ -151,6 +164,14 @@ pub fn build() -> Page {
             });
         })
     };
+    // Newest message id per chat as last loaded; the fast active-chat poll compares against it.
+    let live_last: Rc<RefCell<HashMap<String, String>>> = Default::default();
+    // Chat whose messages are currently shown (to tell a chat switch from a live reload).
+    let shown: Rc<RefCell<Option<String>>> = Default::default();
+    // Backoff (seconds) added to poll intervals after errors, e.g. throttling.
+    let penalty: Rc<Cell<u32>> = Default::default();
+    let list_busy = Rc::new(Cell::new(false));
+    let chat_busy = Rc::new(Cell::new(false));
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     right.append(&msg_scroll);
@@ -203,6 +224,8 @@ pub fn build() -> Page {
             msgs.clone(), current.clone(), stick.clone(), index.clone(), titles.clone(),
             jump.clone(), rows.clone(), apply_jump.clone(),
         );
+        let (live_last, hold, shown, adj) =
+            (live_last.clone(), hold.clone(), shown.clone(), msg_scroll.vadjustment());
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -211,6 +234,8 @@ pub fn build() -> Page {
                 msgs.clone(), stick.clone(), index.clone(), jump.clone(), rows.clone(),
                 apply_jump.clone(), current.clone(),
             );
+            let (live_last, hold, shown, adj) =
+                (live_last.clone(), hold.clone(), shown.clone(), adj.clone());
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -232,11 +257,26 @@ pub fn build() -> Page {
                     if current.borrow().as_deref() != Some(cid.as_str()) {
                         return; // user switched chats meanwhile
                     }
+                    // Follow new messages only if the user is at the bottom or just opened this chat;
+                    // otherwise keep the reading position.
+                    let switched = shown.borrow().as_deref() != Some(cid.as_str());
+                    let at_bottom = adj.upper() - adj.page_size() - adj.value() < 40.0;
                     if jump.borrow().is_none() {
-                        stick.set(true);
-                        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
-                            stick.set(false)
-                        });
+                        if switched || at_bottom {
+                            stick.set(true);
+                            gtk::glib::timeout_add_local_once(Duration::from_millis(600), move || {
+                                stick.set(false)
+                            });
+                        } else {
+                            hold.set(Some(adj.value()));
+                            gtk::glib::timeout_add_local_once(Duration::from_millis(600), move || {
+                                hold.set(None)
+                            });
+                        }
+                    }
+                    *shown.borrow_mut() = Some(cid.clone());
+                    if let Some(newest) = all.first().and_then(|m| m["id"].as_str()) {
+                        live_last.borrow_mut().insert(cid.clone(), newest.to_string());
                     }
                     finder::add(&index, finder::parse(&cid, &title, &all));
                     util::clear(&msgs);
@@ -415,6 +455,8 @@ pub fn build() -> Page {
     let do_refresh: Rc<dyn Fn(bool)> = {
         let pending_c = pending.clone();
         let primed_c = primed.clone();
+        let busy_c = list_busy.clone();
+        let pen_c = penalty.clone();
         let (chats, current, load_msgs, seen, me, signature, cache, prefs, render) = (
             chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
             signature.clone(), cache.clone(), prefs.clone(), render.clone(),
@@ -422,6 +464,8 @@ pub fn build() -> Page {
         Rc::new(move |polling: bool| {
             let pending = pending_c.clone();
             let primed = primed_c.clone();
+            let (list_busy, penalty) = (busy_c.clone(), pen_c.clone());
+            list_busy.set(true);
             let (chats, current, load_msgs, seen, me2, signature, cache, prefs, render) = (
                 chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
                 signature.clone(), cache.clone(), prefs.clone(), render.clone(),
@@ -438,15 +482,18 @@ pub fn build() -> Page {
                     Ok::<_, String>((me, v))
                 },
                 move |r| {
+                    list_busy.set(false);
                     let (my_id, v) = match r {
                         Ok(x) => x,
                         Err(e) => {
+                            penalty.set((penalty.get() * 2).clamp(5, 60)); // back off, e.g. on 429
                             if !polling {
                                 util::toast(&e); // polling stays silent
                             }
                             return;
                         }
                     };
+                    penalty.set(0);
                     *me2.borrow_mut() = my_id.clone();
                     let mut items = v["value"].as_array().cloned().unwrap_or_default();
                     {
@@ -694,16 +741,105 @@ pub fn build() -> Page {
         overlay.add_controller(sc);
     }
 
-    // Live updates: poll every 10 s while the page exists.
+    // Fast poll of the open chat: only its newest messages, reloading on change.
+    let poll_chat: Rc<dyn Fn()> = {
+        let (current, live_last, seen, load_msgs, do_refresh, chat_busy, penalty) = (
+            current.clone(), live_last.clone(), seen.clone(), load_msgs.clone(),
+            do_refresh.clone(), chat_busy.clone(), penalty.clone(),
+        );
+        Rc::new(move || {
+            let Some(cid) = current.borrow().clone() else { return };
+            chat_busy.set(true);
+            let (current, live_last, seen, load_msgs, do_refresh, chat_busy, penalty) = (
+                current.clone(), live_last.clone(), seen.clone(), load_msgs.clone(),
+                do_refresh.clone(), chat_busy.clone(), penalty.clone(),
+            );
+            let path = format!("/me/chats/{cid}/messages?$top=3");
+            util::run(
+                move || graph::get(&path),
+                move |r| {
+                    chat_busy.set(false);
+                    let v = match r {
+                        Ok(v) => v,
+                        Err(_) => {
+                            penalty.set((penalty.get() * 2).clamp(5, 60));
+                            return;
+                        }
+                    };
+                    penalty.set(0);
+                    if current.borrow().as_deref() != Some(cid.as_str()) {
+                        return;
+                    }
+                    let Some(newest) = v["value"][0]["id"].as_str() else { return };
+                    let known = live_last.borrow().get(&cid).cloned();
+                    if known.is_some_and(|k| k != newest) {
+                        // Mark seen so the list poll does not notify for the chat on screen.
+                        seen.borrow_mut().insert(cid.clone(), newest.to_string());
+                        load_msgs();
+                        do_refresh(true); // refresh previews / ordering
+                    }
+                },
+            );
+        })
+    };
+
+    // Scheduler, 500 ms resolution. With a healthy relay: slow safety-net poll only.
+    // Without: 10 s background, 5 s focused, 2 s for the open chat.
     {
-        let do_refresh = do_refresh.clone();
+        let (do_refresh, poll_chat, current, list_busy, chat_busy, penalty) = (
+            do_refresh.clone(), poll_chat.clone(), current.clone(), list_busy.clone(),
+            chat_busy.clone(), penalty.clone(),
+        );
         let weak = overlay.downgrade();
-        gtk::glib::timeout_add_seconds_local(10, move || {
-            if weak.upgrade().and_then(|p| p.parent()).is_none() || !crate::auth::has_session() {
-                return gtk::glib::ControlFlow::Break; // page removed or signed out
+        let (mut last_list, mut last_chat) = (Instant::now(), Instant::now());
+        gtk::glib::timeout_add_local(Duration::from_millis(500), move || {
+            let Some(ov) = weak.upgrade().filter(|o| o.parent().is_some()) else {
+                return gtk::glib::ControlFlow::Break; // page removed
+            };
+            if !crate::auth::has_session() {
+                return gtk::glib::ControlFlow::Break; // signed out
             }
-            do_refresh(true);
+            let focused = ov.root().and_downcast::<gtk::Window>().is_some_and(|w| w.is_active());
+            let watching = focused && ov.is_mapped(); // Teams on screen in the focused window
+            let pushing = relay::healthy();
+            let extra = Duration::from_secs(penalty.get() as u64);
+
+            let list_every = if pushing {
+                POLL_SAFETY_NET
+            } else if watching {
+                POLL_FOCUSED
+            } else {
+                POLL_BACKGROUND
+            };
+            if !list_busy.get() && last_list.elapsed() >= list_every + extra {
+                last_list = Instant::now();
+                do_refresh(true);
+            }
+            if !pushing
+                && watching
+                && current.borrow().is_some()
+                && !chat_busy.get()
+                && last_chat.elapsed() >= POLL_ACTIVE_CHAT + extra
+            {
+                last_chat = Instant::now();
+                poll_chat();
+            }
             gtk::glib::ControlFlow::Continue
+        });
+    }
+
+    // Relay push events (none until the relay client exists, see relay.rs).
+    if let Some(rx) = relay::start() {
+        let (do_refresh, current, load_msgs) = (do_refresh.clone(), current.clone(), load_msgs.clone());
+        gtk::glib::spawn_future_local(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let relay::PushEvent::Message { chat_id } = &ev {
+                    if current.borrow().as_deref() == Some(chat_id.as_str()) {
+                        load_msgs();
+                    }
+                }
+                do_refresh(true);
+            }
         });
     }
 

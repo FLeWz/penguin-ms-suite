@@ -1,6 +1,7 @@
 mod auth;
 mod graph;
 mod pages;
+mod relay;
 mod util;
 
 use adw::prelude::*;
