@@ -2,7 +2,11 @@ use super::Page;
 use crate::{graph, util};
 use adw::prelude::*;
 use serde_json::{json, Value};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 fn chat_title(c: &Value, me: &str) -> String {
     if let Some(t) = c["topic"].as_str().filter(|t| !t.is_empty()) {
@@ -39,6 +43,52 @@ fn header(text: &str) -> gtk::ListBoxRow {
     r
 }
 
+/// Local (per-machine) chat preferences, stored in the app config dir.
+#[derive(Default)]
+struct Prefs {
+    fav: HashSet<String>,
+    hidden: HashSet<String>,
+}
+
+impl Prefs {
+    fn path() -> std::path::PathBuf {
+        crate::auth::dir().join("teams_prefs.json")
+    }
+    fn load() -> Self {
+        let v: Value = std::fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Null);
+        let set = |k: &str| -> HashSet<String> {
+            v[k].as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        };
+        Prefs { fav: set("favourites"), hidden: set("hidden") }
+    }
+    fn save(&self) {
+        let v = json!({"favourites": self.fav, "hidden": self.hidden});
+        let _ = std::fs::create_dir_all(crate::auth::dir());
+        let _ = std::fs::write(Self::path(), v.to_string());
+    }
+    fn toggle(set: &mut HashSet<String>, id: &str) {
+        if !set.remove(id) {
+            set.insert(id.to_string());
+        }
+    }
+}
+
+fn icon_button(icon: &str, tip: &str) -> gtk::Button {
+    let b = gtk::Button::from_icon_name(icon);
+    b.add_css_class("flat");
+    b.add_css_class("circular");
+    b.set_valign(gtk::Align::Center);
+    b.set_tooltip_text(Some(tip));
+    b
+}
+
 pub fn build() -> Page {
     let chats = gtk::ListBox::new();
     chats.add_css_class("navigation-sidebar");
@@ -68,7 +118,14 @@ pub fn build() -> Page {
     right.append(&entry);
     right.set_hexpand(true);
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-    let left = util::pane(&chats);
+    let show_hidden = gtk::ToggleButton::with_label("Show hidden");
+    show_hidden.add_css_class("flat");
+    show_hidden.set_margin_start(6);
+    show_hidden.set_margin_end(6);
+    show_hidden.set_margin_top(4);
+    let left = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    left.append(&show_hidden);
+    left.append(&util::pane(&chats));
     left.set_size_request(260, -1);
     paned.set_start_child(Some(&left));
     paned.set_end_child(Some(&right));
@@ -153,16 +210,112 @@ pub fn build() -> Page {
     let seen: Rc<RefCell<HashMap<String, String>>> = Default::default();
     let me: Rc<RefCell<String>> = Default::default();
     let signature: Rc<RefCell<String>> = Default::default();
+    let cache: Rc<RefCell<(String, Vec<Value>)>> = Default::default(); // (my id, chats)
+    let prefs = Rc::new(RefCell::new(Prefs::load()));
+    // Lets row buttons re-render the list (render refers to itself through this cell).
+    let render_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
+
+    let render: Rc<dyn Fn()> = {
+        let (chats, ids, current, quiet, cache, prefs, render_cell, show_hidden) = (
+            chats.clone(), ids.clone(), current.clone(), quiet.clone(), cache.clone(),
+            prefs.clone(), render_cell.clone(), show_hidden.clone(),
+        );
+        Rc::new(move || {
+            let (my_id, items) = cache.borrow().clone();
+            let p = prefs.borrow();
+            let one = |c: &Value| c["chatType"].as_str() == Some("oneOnOne");
+            let id_of = |c: &Value| c["id"].as_str().unwrap_or("").to_string();
+            let vis = |c: &&Value| !p.hidden.contains(&id_of(c));
+            let sections: Vec<(&str, Vec<&Value>)> = vec![
+                ("FAVOURITES", items.iter().filter(vis).filter(|c| p.fav.contains(&id_of(c))).collect()),
+                ("PEOPLE", items.iter().filter(vis).filter(|c| !p.fav.contains(&id_of(c)) && one(c)).collect()),
+                ("GROUPS", items.iter().filter(vis).filter(|c| !p.fav.contains(&id_of(c)) && !one(c)).collect()),
+                (
+                    "HIDDEN",
+                    if show_hidden.is_active() {
+                        items.iter().filter(|c| p.hidden.contains(&id_of(c))).collect()
+                    } else {
+                        vec![]
+                    },
+                ),
+            ];
+
+            quiet.set(true);
+            util::clear(&chats);
+            let mut order: Vec<String> = vec![];
+            for (label, sel) in sections {
+                if sel.is_empty() {
+                    continue;
+                }
+                chats.append(&header(label));
+                order.push(String::new());
+                for c in sel {
+                    let cid = id_of(c);
+                    let prev = util::strip_html(c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""));
+                    let is_fav = p.fav.contains(&cid);
+                    let is_hidden = p.hidden.contains(&cid);
+
+                    let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                    let info = util::row(&chat_title(c, &my_id), &prev);
+                    info.set_hexpand(true);
+                    line.append(&info);
+
+                    let fav_btn = icon_button(
+                        if is_fav { "starred-symbolic" } else { "non-starred-symbolic" },
+                        if is_fav { "Remove from favourites" } else { "Add to favourites" },
+                    );
+                    let hide_btn = icon_button(
+                        if is_hidden { "view-reveal-symbolic" } else { "view-conceal-symbolic" },
+                        if is_hidden { "Unhide chat" } else { "Hide chat" },
+                    );
+                    for (btn, is_fav_btn) in [(&fav_btn, true), (&hide_btn, false)] {
+                        let (prefs, render_cell, cid) = (prefs.clone(), render_cell.clone(), cid.clone());
+                        btn.connect_clicked(move |_| {
+                            {
+                                let mut p = prefs.borrow_mut();
+                                if is_fav_btn {
+                                    Prefs::toggle(&mut p.fav, &cid);
+                                } else {
+                                    Prefs::toggle(&mut p.hidden, &cid);
+                                }
+                                p.save();
+                            }
+                            let r = render_cell.borrow().clone();
+                            if let Some(r) = r {
+                                // Defer: we are inside a widget that render() destroys.
+                                gtk::glib::idle_add_local_once(move || r());
+                            }
+                        });
+                        line.append(btn);
+                    }
+                    chats.append(&line);
+                    order.push(cid);
+                }
+            }
+            // Keep the open chat selected.
+            let cur = current.borrow().clone();
+            if let Some(i) = cur.and_then(|c| order.iter().position(|o| *o == c)) {
+                chats.select_row(chats.row_at_index(i as i32).as_ref());
+            }
+            *ids.borrow_mut() = order;
+            quiet.set(false);
+        })
+    };
+    *render_cell.borrow_mut() = Some(render.clone());
+    {
+        let render = render.clone();
+        show_hidden.connect_toggled(move |_| render());
+    }
 
     let do_refresh: Rc<dyn Fn(bool)> = {
-        let (chats, ids, current, load_msgs, quiet, seen, me, signature) = (
-            chats.clone(), ids.clone(), current.clone(), load_msgs.clone(),
-            quiet.clone(), seen.clone(), me.clone(), signature.clone(),
+        let (chats, current, load_msgs, seen, me, signature, cache, prefs, render) = (
+            chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
+            signature.clone(), cache.clone(), prefs.clone(), render.clone(),
         );
         Rc::new(move |polling: bool| {
-            let (chats, ids, current, load_msgs, quiet, seen, me2, signature) = (
-                chats.clone(), ids.clone(), current.clone(), load_msgs.clone(),
-                quiet.clone(), seen.clone(), me.clone(), signature.clone(),
+            let (chats, current, load_msgs, seen, me2, signature, cache, prefs, render) = (
+                chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
+                signature.clone(), cache.clone(), prefs.clone(), render.clone(),
             );
             let known_me = me.borrow().clone();
             util::run(
@@ -208,6 +361,9 @@ pub fn build() -> Page {
                         }
                         let is_current = current.borrow().as_deref() == Some(cid);
                         new_in_current |= is_current;
+                        if prefs.borrow().hidden.contains(cid) {
+                            continue; // hidden chats stay silent
+                        }
                         let focused = chats
                             .root()
                             .and_downcast::<gtk::Window>()
@@ -227,7 +383,7 @@ pub fn build() -> Page {
                         }
                     }
 
-                    // Rebuild the list only when something visible changed.
+                    // Re-render only when something visible changed.
                     let sig: String = items
                         .iter()
                         .map(|c| format!("{}|{}", c["id"], c["lastMessagePreview"]["id"]))
@@ -235,35 +391,8 @@ pub fn build() -> Page {
                         .join(",");
                     if *signature.borrow() != sig {
                         *signature.borrow_mut() = sig;
-                        quiet.set(true);
-                        util::clear(&chats);
-                        let mut order: Vec<String> = vec![];
-                        // People = 1:1 chats. Groups = group chats and meeting chats.
-                        for (label, people) in [("PEOPLE", true), ("GROUPS", false)] {
-                            let sel: Vec<&Value> = items
-                                .iter()
-                                .filter(|c| (c["chatType"].as_str() == Some("oneOnOne")) == people)
-                                .collect();
-                            if sel.is_empty() {
-                                continue;
-                            }
-                            chats.append(&header(label));
-                            order.push(String::new());
-                            for c in sel {
-                                let prev = util::strip_html(
-                                    c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""),
-                                );
-                                chats.append(&util::row(&chat_title(c, &my_id), &prev));
-                                order.push(c["id"].as_str().unwrap_or("").to_string());
-                            }
-                        }
-                        // Keep the open chat selected.
-                        let cur = current.borrow().clone();
-                        if let Some(i) = cur.and_then(|c| order.iter().position(|o| *o == c)) {
-                            chats.select_row(chats.row_at_index(i as i32).as_ref());
-                        }
-                        *ids.borrow_mut() = order;
-                        quiet.set(false);
+                        *cache.borrow_mut() = (my_id, items);
+                        render();
                     }
                     if new_in_current {
                         load_msgs();

@@ -29,7 +29,7 @@ const DEFAULT_TENANT: &str = env!("BUILTIN_PENGUIN_MS_TENANT");
 
 static ACCESS: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
-fn dir() -> PathBuf {
+pub fn dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
