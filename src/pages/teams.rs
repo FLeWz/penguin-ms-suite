@@ -4,15 +4,39 @@ use adw::prelude::*;
 use serde_json::{json, Value};
 use std::{cell::RefCell, rc::Rc};
 
-fn chat_title(c: &Value) -> String {
+fn chat_title(c: &Value, me: &str) -> String {
     if let Some(t) = c["topic"].as_str().filter(|t| !t.is_empty()) {
         return t.into();
     }
     let names: Vec<&str> = c["members"]
         .as_array()
-        .map(|m| m.iter().filter_map(|x| x["displayName"].as_str()).collect())
+        .map(|m| {
+            m.iter()
+                .filter(|x| x["userId"].as_str() != Some(me))
+                .filter_map(|x| x["displayName"].as_str())
+                .collect()
+        })
         .unwrap_or_default();
-    if names.is_empty() { "Chat".into() } else { names.join(", ") }
+    if names.is_empty() {
+        "Chat".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn header(text: &str) -> gtk::ListBoxRow {
+    let l = gtk::Label::new(Some(text));
+    l.set_xalign(0.0);
+    l.add_css_class("caption-heading");
+    l.add_css_class("dim-label");
+    l.set_margin_top(10);
+    l.set_margin_bottom(4);
+    l.set_margin_start(10);
+    let r = gtk::ListBoxRow::new();
+    r.set_child(Some(&l));
+    r.set_selectable(false);
+    r.set_activatable(false);
+    r
 }
 
 pub fn build() -> Page {
@@ -78,7 +102,11 @@ pub fn build() -> Page {
         let (ids, current, load_msgs) = (ids.clone(), current.clone(), load_msgs.clone());
         chats.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
-            *current.borrow_mut() = ids.borrow().get(row.index() as usize).cloned();
+            let id = ids.borrow().get(row.index() as usize).cloned().filter(|i| !i.is_empty());
+            if id.is_none() {
+                return;
+            }
+            *current.borrow_mut() = id;
             load_msgs();
         });
     }
@@ -102,15 +130,35 @@ pub fn build() -> Page {
     let refresh: Rc<dyn Fn()> = Rc::new(move || {
         let (chats, ids) = (chats.clone(), ids.clone());
         util::run_ok(
-            || graph::get("/me/chats?$expand=members&$top=40&$orderby=lastMessagePreview/createdDateTime%20desc"),
-            move |v| {
+            || {
+                let me = graph::get("/me?$select=id")?["id"].as_str().unwrap_or("").to_string();
+                let v = graph::get("/me/chats?$expand=members&$top=50&$orderby=lastMessagePreview/createdDateTime%20desc")?;
+                Ok((me, v))
+            },
+            move |(me, v)| {
                 util::clear(&chats);
                 let items = v["value"].as_array().cloned().unwrap_or_default();
-                *ids.borrow_mut() = items.iter().map(|c| c["id"].as_str().unwrap_or("").to_string()).collect();
-                for c in &items {
-                    let prev = util::strip_html(c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""));
-                    chats.append(&util::row(&chat_title(c), &prev));
+                let mut order: Vec<String> = vec![];
+                // People = 1:1 chats. Groups = group chats and meeting chats.
+                for (label, people) in [("PEOPLE", true), ("GROUPS", false)] {
+                    let sel: Vec<&Value> = items
+                        .iter()
+                        .filter(|c| (c["chatType"].as_str() == Some("oneOnOne")) == people)
+                        .collect();
+                    if sel.is_empty() {
+                        continue;
+                    }
+                    chats.append(&header(label));
+                    order.push(String::new());
+                    for c in sel {
+                        let prev = util::strip_html(
+                            c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""),
+                        );
+                        chats.append(&util::row(&chat_title(c, &me), &prev));
+                        order.push(c["id"].as_str().unwrap_or("").to_string());
+                    }
                 }
+                *ids.borrow_mut() = order;
             },
         );
     });
