@@ -209,6 +209,11 @@ impl Media {
             .collect()
     }
 
+    /// True while images near the viewport are queued or downloading.
+    pub fn busy(&self) -> bool {
+        self.kick_queued.get() || !self.loading.borrow().is_empty()
+    }
+
     /// Lazy loading: images are fetched only when near the viewport, nearest first, a few at
     /// a time. Call once with the message list's scroll window.
     pub fn attach_viewport(self: &Rc<Self>, scroll: &gtk::ScrolledWindow) {

@@ -338,6 +338,11 @@ impl Links {
         Rc::new(Links { enabled, previews: Default::default(), textures: Default::default(), inflight: Default::default() })
     }
 
+    /// True while any link preview is still being fetched.
+    pub fn busy(&self) -> bool {
+        !self.inflight.borrow().is_empty()
+    }
+
     /// Preview cards for links in the message; cards appear when the fetch finishes.
     pub fn widgets(self: &Rc<Self>, m: &Value, text: &str) -> Vec<gtk::Widget> {
         if !self.enabled {
