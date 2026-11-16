@@ -373,8 +373,8 @@ pub fn build() -> Page {
             let vis = |c: &&Value| !p.hidden.contains(&id_of(c));
             let sections: Vec<(&str, Vec<&Value>)> = vec![
                 ("FAVOURITES", items.iter().filter(vis).filter(|c| p.fav.contains(&id_of(c))).collect()),
-                ("PEOPLE", items.iter().filter(vis).filter(|c| !p.fav.contains(&id_of(c)) && one(c)).collect()),
                 ("GROUPS", items.iter().filter(vis).filter(|c| !p.fav.contains(&id_of(c)) && !one(c)).collect()),
+                ("PEOPLE", items.iter().filter(vis).filter(|c| !p.fav.contains(&id_of(c)) && one(c)).collect()),
                 (
                     "HIDDEN",
                     if show_hidden.is_active() {
