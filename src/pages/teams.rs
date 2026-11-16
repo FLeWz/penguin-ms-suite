@@ -197,6 +197,30 @@ pub fn build() -> Page {
     entry.set_margin_bottom(6);
     entry.set_margin_start(6);
     entry.set_margin_end(6);
+    entry.set_hexpand(true);
+    // Type ":smile" for emoji completion; Ctrl+. also opens GTK's chooser in the entry.
+    entry.set_property("enable-emoji-completion", true);
+    let emoji_btn = gtk::MenuButton::new();
+    emoji_btn.set_icon_name("face-smile-symbolic");
+    emoji_btn.add_css_class("flat");
+    emoji_btn.add_css_class("quiet-icon");
+    emoji_btn.set_tooltip_text(Some("Insert emoji"));
+    emoji_btn.set_valign(gtk::Align::Center);
+    let chooser = gtk::EmojiChooser::new();
+    emoji_btn.set_popover(Some(&chooser));
+    {
+        let entry = entry.clone();
+        chooser.connect_emoji_picked(move |_, emoji| {
+            let mut pos = entry.position();
+            entry.insert_text(emoji, &mut pos);
+            entry.set_position(pos);
+            entry.grab_focus_without_selecting();
+        });
+    }
+    let compose = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    compose.append(&entry);
+    compose.append(&emoji_btn);
+    compose.set_margin_end(6);
 
     let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let msg_scroll = util::pane(&msgs);
@@ -281,7 +305,7 @@ pub fn build() -> Page {
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     right.append(&msg_scroll);
-    right.append(&entry);
+    right.append(&compose);
     right.set_hexpand(true);
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     let show_hidden = gtk::ToggleButton::with_label("Show hidden");
