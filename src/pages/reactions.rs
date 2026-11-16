@@ -46,23 +46,30 @@ pub struct Reactor {
     message: String,
     my_id: String,
     chips: gtk::Box,
+    spacer: gtk::Widget,
     /// Reaction shown -> the raw type to send to remove it, for the reactions I made.
     mine: RefCell<HashMap<String, String>>,
 }
 
 impl Reactor {
-    /// Returns the reactor, the chips row (to straddle the bubble's bottom edge) and the
-    /// hover "add reaction" button (to put inside the bubble).
-    pub fn new(chat: &str, message: &str, my_id: &str) -> (Rc<Self>, gtk::Box, Option<gtk::Widget>) {
-        let mut add_btn = None;
+    /// Returns the reactor, the row with the chips and the hover "add reaction" button (it is
+    /// laid over the bubble's bottom edge), and a spacer that reserves the room under the
+    /// bubble for the half of the row that sticks out, only while there are chips.
+    pub fn new(chat: &str, message: &str, my_id: &str) -> (Rc<Self>, gtk::Box, gtk::Widget) {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        spacer.set_size_request(-1, 11);
+        spacer.set_visible(false);
         let chips = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let me = Rc::new(Reactor {
             chat: chat.to_string(),
             message: message.to_string(),
             my_id: my_id.to_string(),
             chips: chips.clone(),
+            spacer: spacer.clone().upcast(),
             mine: Default::default(),
         });
+        row.append(&chips);
         if !message.is_empty() {
             let add = gtk::MenuButton::new();
             add.set_icon_name("face-smile-symbolic");
@@ -85,9 +92,9 @@ impl Reactor {
             }
             pop.set_child(Some(&strip));
             add.set_popover(Some(&pop));
-            add_btn = Some(add.upcast());
+            row.append(&add);
         }
-        (me, chips, add_btn)
+        (me, row, spacer.upcast())
     }
 
     /// Redraw the chips from the message's `reactions` array.
@@ -124,7 +131,9 @@ impl Reactor {
             b.connect_clicked(move |_| me.toggle(&e, !was_mine));
             self.chips.append(&b);
         }
-        self.chips.set_visible(self.chips.first_child().is_some());
+        let any = self.chips.first_child().is_some();
+        self.chips.set_visible(any);
+        self.spacer.set_visible(any);
     }
 
     fn toggle(self: &Rc<Self>, emoji: &str, set: bool) {

@@ -286,8 +286,8 @@ fn bubble(
     mine: bool,
     media: &[gtk::Widget],
     link_cards: &[gtk::Widget],
-    chips: &gtk::Box,
-    add_react: Option<&gtk::Widget>,
+    react_row: &gtk::Box,
+    react_spacer: &gtk::Widget,
 ) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
     b.add_css_class("bubble");
@@ -347,32 +347,25 @@ fn bubble(
     outer.set_margin_end(12);
     // Spacer keeps bubbles off the far edge on the opposite side.
     outer.set_halign(gtk::Align::Fill);
-    // Column: bubble, then the reaction chips painted half over its bottom edge (CSS
-    // transform; the chips keep their own row of layout space below the bubble).
-    let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // Column: the bubble, then a spacer that exists only while there are reactions. The
+    // reaction row (chips and the hover add button) is an overlay at the bottom of the column,
+    // so half of it covers the bubble's bottom edge and half sits in the spacer's room.
     let align = if mine { gtk::Align::End } else { gtk::Align::Start };
-    col.set_hexpand(true);
-    col.set_halign(align);
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     b.set_hexpand(false);
     b.set_halign(gtk::Align::Fill);
-    // The add-reaction button floats over the bubble's top corner on hover; as an overlay it
-    // takes no space, so it never changes the bubble's size.
-    let ov = gtk::Overlay::new();
-    ov.add_css_class("msg-ov");
-    ov.set_halign(align);
-    ov.set_child(Some(&b));
-    if let Some(a) = add_react {
-        a.set_halign(gtk::Align::End);
-        a.set_valign(gtk::Align::Start);
-        a.set_margin_top(2);
-        a.set_margin_end(2);
-        ov.add_overlay(a);
-    }
-    chips.add_css_class("react-straddle");
-    chips.set_halign(align);
-    col.append(&ov);
-    col.append(chips);
-    outer.append(&col);
+    col.append(&b);
+    col.append(react_spacer);
+    let stack = gtk::Overlay::new();
+    stack.add_css_class("msg-stack");
+    stack.set_hexpand(true);
+    stack.set_halign(align);
+    stack.set_child(Some(&col));
+    react_row.set_halign(gtk::Align::Start);
+    react_row.set_valign(gtk::Align::End);
+    react_row.set_margin_start(10);
+    stack.add_overlay(react_row);
+    outer.append(&stack);
     outer
 }
 
@@ -548,11 +541,12 @@ pub fn build() -> Page {
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
              .finder-scrim { background: alpha(black, 0.45); }
              .finder-card { background: @popover_bg_color; color: @popover_fg_color; border: 1px solid alpha(currentColor, 0.18); border-radius: 12px; box-shadow: 0 10px 32px alpha(black, 0.5); }
-             .react-straddle { transform: translate(0, -11px); margin-left: 10px; margin-right: 10px; }
-             .react-chip { min-height: 22px; min-width: 0; padding: 0 8px; border-radius: 999px; background: alpha(currentColor, 0.1); font-size: 0.85em; }
-             .react-mine { background: alpha(@accent_bg_color, 0.35); }
-             .react-add { opacity: 0; min-height: 0; min-width: 0; padding: 2px; border-radius: 999px; background: alpha(black, 0.35); color: white; }
-             .msg-ov:hover .react-add, .react-add:checked { opacity: 1; }
+             .react-chip { min-height: 22px; min-width: 0; padding: 0 8px; border-radius: 999px; background: mix(@window_bg_color, @window_fg_color, 0.16); font-size: 0.85em; }
+             .react-mine { background: mix(@window_bg_color, @accent_bg_color, 0.55); }
+             .react-add { opacity: 0; min-height: 0; min-width: 0; }
+             .react-add button { min-height: 0; min-width: 0; padding: 3px; border-radius: 999px; background: alpha(black, 0.35); color: white; }
+             .react-add image { -gtk-icon-size: 12px; }
+             .msg-stack:hover .react-add, .react-add:checked { opacity: 1; }
              .msg-selected { background: alpha(@accent_bg_color, 0.25); border-radius: 8px; }
              .lightbox { background: alpha(black, 0.85); }
              .thumb { transition: opacity 250ms ease-in; }
@@ -1076,7 +1070,7 @@ pub fn build() -> Page {
                             m["body"]["content"].as_str().unwrap_or(""),
                             m["body"]["contentType"].as_str().unwrap_or("html"),
                         );
-                        let (reactor, chips, add_btn) =
+                        let (reactor, react_row, react_spacer) =
                             reactions::Reactor::new(&cid, m["id"].as_str().unwrap_or(""), &my_id);
                         reactor.refresh(&m["reactions"]);
                         let r = bubble(
@@ -1087,8 +1081,8 @@ pub fn build() -> Page {
                             mine,
                             &media_widgets,
                             &link_cards,
-                            &chips,
-                            add_btn.as_ref(),
+                            &react_row,
+                            &react_spacer,
                         );
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
