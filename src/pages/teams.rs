@@ -91,8 +91,8 @@ impl Prefs {
 /// Compact two-line chat entry: title, then a one-line preview.
 fn chat_info(title: &str, preview: &str, unread: bool) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    b.set_margin_top(2);
-    b.set_margin_bottom(2);
+    b.set_margin_top(5);
+    b.set_margin_bottom(5);
     b.set_margin_start(6);
     b.set_margin_end(4);
     for (i, (text, classes)) in [(title, "chat-title"), (preview, "chat-preview dim-label")].into_iter().enumerate() {
