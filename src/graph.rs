@@ -3,7 +3,7 @@ use crate::auth;
 use serde_json::Value;
 use std::time::Duration;
 
-const BASE: &str = "https://graph.microsoft.com/v1.0";
+pub const BASE: &str = "https://graph.microsoft.com/v1.0";
 
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()

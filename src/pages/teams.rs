@@ -1,4 +1,4 @@
-use super::Page;
+use super::{finder, Page};
 use crate::{graph, util};
 use adw::prelude::*;
 use serde_json::{json, Value};
@@ -89,7 +89,23 @@ fn icon_button(icon: &str, tip: &str) -> gtk::Button {
     b
 }
 
+/// Scroll the message list so widget `w` (a message row) is near the top third.
+fn scroll_to(list: &gtk::ListBox, adj: &gtk::Adjustment, w: &gtk::Widget) -> bool {
+    let Some(row) = w.parent() else { return false };
+    let Some(b) = row.compute_bounds(list) else { return false };
+    adj.set_value((b.y() as f64 - adj.page_size() / 3.0).max(0.0));
+    true
+}
+
 pub fn build() -> Page {
+    static CSS: std::sync::Once = std::sync::Once::new();
+    CSS.call_once(|| {
+        let p = gtk::CssProvider::new();
+        p.load_from_data(".search-hit { background: alpha(@accent_bg_color, 0.25); border-radius: 6px; }");
+        if let Some(d) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(&d, &p, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
+    });
     let chats = gtk::ListBox::new();
     chats.add_css_class("navigation-sidebar");
     let msgs = gtk::ListBox::new();
@@ -106,14 +122,37 @@ pub fn build() -> Page {
     // While `stick` is set, keep the view pinned to the newest message as
     // wrapped labels settle their final height.
     let stick = Rc::new(std::cell::Cell::new(false));
+    // Message id to bring into view after loading (from the finder), and the rows by id.
+    let jump: Rc<RefCell<Option<String>>> = Default::default();
+    let rows: Rc<RefCell<HashMap<String, gtk::Widget>>> = Default::default();
     {
-        let stick = stick.clone();
+        let (stick, jump, rows, msgs) = (stick.clone(), jump.clone(), rows.clone(), msgs.clone());
         msg_scroll.vadjustment().connect_changed(move |a| {
-            if stick.get() {
+            let target = jump.borrow().clone();
+            if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
+                scroll_to(&msgs, a, &w); // keep it in view while labels settle
+            } else if stick.get() {
                 a.set_value(a.upper() - a.page_size());
             }
         });
     }
+    let apply_jump: Rc<dyn Fn()> = {
+        let (jump, rows, msgs, adj) = (jump.clone(), rows.clone(), msgs.clone(), msg_scroll.vadjustment());
+        Rc::new(move || {
+            let Some(id) = jump.borrow().clone() else { return };
+            let Some(w) = rows.borrow().get(&id).cloned() else { return };
+            if let Some(r) = w.parent() {
+                r.add_css_class("search-hit");
+            }
+            scroll_to(&msgs, &adj, &w);
+            let jump = jump.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(700), move || {
+                *jump.borrow_mut() = None;
+            });
+        })
+    };
+    let index: finder::Index = Default::default();
+    let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     right.append(&msg_scroll);
     right.append(&entry);
     right.set_hexpand(true);
@@ -138,7 +177,12 @@ pub fn build() -> Page {
         .propagate_natural_height(true)
         .visible(false)
         .build();
+    let find_btn = gtk::Button::with_label("Search messages  (Ctrl+K)");
+    find_btn.add_css_class("flat");
+    find_btn.set_margin_start(6);
+    find_btn.set_margin_end(6);
     let left = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    left.append(&find_btn);
     left.append(&search);
     left.append(&results_scroll);
     left.append(&show_hidden);
@@ -155,19 +199,49 @@ pub fn build() -> Page {
     let current: Rc<RefCell<Option<String>>> = Default::default();
 
     let load_msgs = {
-        let (msgs, current, stick) = (msgs.clone(), current.clone(), stick.clone());
+        let (msgs, current, stick, index, titles, jump, rows, apply_jump) = (
+            msgs.clone(), current.clone(), stick.clone(), index.clone(), titles.clone(),
+            jump.clone(), rows.clone(), apply_jump.clone(),
+        );
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
-            let (msgs, stick) = (msgs.clone(), stick.clone());
+            let want = jump.borrow().clone();
+            let title = titles.borrow().get(&id).cloned().unwrap_or_default();
+            let (msgs, stick, index, jump, rows, apply_jump, current) = (
+                msgs.clone(), stick.clone(), index.clone(), jump.clone(), rows.clone(),
+                apply_jump.clone(), current.clone(),
+            );
+            let cid = id.clone();
             util::run_ok(
-                move || graph::get(&format!("/me/chats/{id}/messages?$top=40")),
-                move |v| {
-                    stick.set(true);
-                    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
-                        stick.set(false)
-                    });
+                move || {
+                    // One page normally; when jumping to an older message, page back until found.
+                    let mut path = format!("/me/chats/{id}/messages?$top=50");
+                    let mut all: Vec<Value> = vec![];
+                    for _ in 0..6 {
+                        let v = graph::get(&path)?;
+                        all.extend(v["value"].as_array().cloned().unwrap_or_default());
+                        let found = want.as_ref().is_none_or(|w| all.iter().any(|m| m["id"].as_str() == Some(w)));
+                        match v["@odata.nextLink"].as_str() {
+                            Some(u) if !found => path = u.strip_prefix(graph::BASE).unwrap_or(u).to_string(),
+                            _ => break,
+                        }
+                    }
+                    Ok(all)
+                },
+                move |all| {
+                    if current.borrow().as_deref() != Some(cid.as_str()) {
+                        return; // user switched chats meanwhile
+                    }
+                    if jump.borrow().is_none() {
+                        stick.set(true);
+                        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+                            stick.set(false)
+                        });
+                    }
+                    finder::add(&index, finder::parse(&cid, &title, &all));
                     util::clear(&msgs);
-                    let mut items = v["value"].as_array().cloned().unwrap_or_default();
+                    rows.borrow_mut().clear();
+                    let mut items = all;
                     items.reverse(); // API returns newest first
                     for m in items {
                         let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
@@ -183,13 +257,16 @@ pub fn build() -> Page {
                             l.set_ellipsize(gtk::pango::EllipsizeMode::None);
                             l.set_selectable(true);
                         }
+                        if let Some(mid) = m["id"].as_str() {
+                            rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
+                        }
                         msgs.append(&r);
                     }
+                    apply_jump();
                 },
             );
         })
     };
-
     {
         let (ids, current, load_msgs, quiet) =
             (ids.clone(), current.clone(), load_msgs.clone(), quiet.clone());
@@ -236,12 +313,18 @@ pub fn build() -> Page {
     let render_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
 
     let render: Rc<dyn Fn()> = {
-        let (chats, ids, current, quiet, cache, prefs, render_cell, show_hidden) = (
+        let (chats, ids, current, quiet, cache, prefs, render_cell, show_hidden, titles) = (
             chats.clone(), ids.clone(), current.clone(), quiet.clone(), cache.clone(),
-            prefs.clone(), render_cell.clone(), show_hidden.clone(),
+            prefs.clone(), render_cell.clone(), show_hidden.clone(), titles.clone(),
         );
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
+            {
+                let mut t = titles.borrow_mut();
+                for c in &items {
+                    t.insert(c["id"].as_str().unwrap_or("").to_string(), chat_title(c, &my_id));
+                }
+            }
             let p = prefs.borrow();
             let one = |c: &Value| c["chatType"].as_str() == Some("oneOnOne");
             let id_of = |c: &Value| c["id"].as_str().unwrap_or("").to_string();
@@ -555,10 +638,60 @@ pub fn build() -> Page {
         });
     }
 
+    // Fuzzy message finder (Ctrl+F: this chat, Ctrl+K: all chats).
+    let fnd = Rc::new(finder::build(finder::Hooks {
+        index: index.clone(),
+        current: {
+            let current = current.clone();
+            Rc::new(move || current.borrow().clone())
+        },
+        chats: {
+            let titles = titles.clone();
+            Rc::new(move || titles.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        },
+        jump: {
+            let (jump, rows, current, render, load_msgs, apply_jump) =
+                (jump.clone(), rows.clone(), current.clone(), render.clone(), load_msgs.clone(), apply_jump.clone());
+            Rc::new(move |chat: String, msg: String| {
+                *jump.borrow_mut() = Some(msg.clone());
+                let same = current.borrow().as_deref() == Some(chat.as_str());
+                if same && rows.borrow().contains_key(&msg) {
+                    apply_jump();
+                } else {
+                    *current.borrow_mut() = Some(chat);
+                    render();
+                    load_msgs();
+                }
+            })
+        },
+    }));
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&paned));
+    overlay.add_overlay(&fnd.panel);
+    {
+        let fnd = fnd.clone();
+        find_btn.connect_clicked(move |_| fnd.open(true));
+    }
+    {
+        let sc = gtk::ShortcutController::new();
+        sc.set_propagation_phase(gtk::PropagationPhase::Capture);
+        for (keys, all) in [("<Control>f", false), ("<Control>k", true), ("<Control><Shift>f", true)] {
+            let fnd = fnd.clone();
+            sc.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(keys),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    fnd.open(all);
+                    gtk::glib::Propagation::Stop
+                })),
+            ));
+        }
+        overlay.add_controller(sc);
+    }
+
     // Live updates: poll every 10 s while the page exists.
     {
         let do_refresh = do_refresh.clone();
-        let weak = paned.downgrade();
+        let weak = overlay.downgrade();
         gtk::glib::timeout_add_seconds_local(10, move || {
             if weak.upgrade().and_then(|p| p.parent()).is_none() || !crate::auth::has_session() {
                 return gtk::glib::ControlFlow::Break; // page removed or signed out
@@ -569,5 +702,5 @@ pub fn build() -> Page {
     }
 
     let refresh: Rc<dyn Fn()> = Rc::new(move || do_refresh(false));
-    Page { widget: paned.upcast(), refresh }
+    Page { widget: overlay.upcast(), refresh }
 }
