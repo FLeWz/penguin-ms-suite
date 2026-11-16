@@ -70,4 +70,8 @@ at `~/.config/penguin-ms-suite/refresh_token`.
 ## Performance notes
 - Pages are built lazily on first visit.
 - Network on worker threads; UI thread never blocks.
+- Teams polling is adaptive: chat list every 10 s in the background and 5 s when
+  Teams is visible and focused; the open chat every 2 s (newest 3 messages only).
+  Errors back off up to 60 s. A push relay can replace this later (it falls back
+  to polling if the relay is down): see `docs/relay-architecture.md`.
 - Cairo renderer by default (set `GSK_RENDERER` to override).
