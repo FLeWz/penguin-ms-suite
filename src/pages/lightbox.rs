@@ -31,9 +31,19 @@ pub fn show_image(tex: &gdk::Texture, name: &str) -> bool {
     backdrop.set_hexpand(true);
     backdrop.set_vexpand(true);
 
-    let pic = gtk::Picture::for_paintable(tex);
-    pic.set_content_fit(gtk::ContentFit::Fill);
-    pic.set_can_shrink(true);
+    // The size comes from an empty spacer; the picture is an overlay on it. A picture asked for
+    // a size with set_size_request still reports its full pixel size as its natural size, so
+    // the scrolled window would show the image at 100% (or squeezed) instead of the zoom.
+    // Overlay children do not take part in the size, and Contain keeps the aspect ratio.
+    let spacer = gtk::DrawingArea::new();
+    let pic = gtk::Overlay::new();
+    pic.set_child(Some(&spacer));
+    let img = gtk::Picture::for_paintable(tex);
+    img.set_content_fit(gtk::ContentFit::Contain);
+    img.set_can_shrink(true);
+    img.set_halign(gtk::Align::Fill);
+    img.set_valign(gtk::Align::Fill);
+    pic.add_overlay(&img);
     pic.set_halign(gtk::Align::Center);
     pic.set_valign(gtk::Align::Center);
     pic.set_tooltip_text(Some(name));
@@ -54,8 +64,8 @@ pub fn show_image(tex: &gdk::Texture, name: &str) -> bool {
 
     // Set the zoom, keeping the image point under (ax, ay) (viewport coordinates) in place.
     let apply: Rc<dyn Fn(f64, f64, f64)> = {
-        let (scale, pic, scroll, pct, pending) =
-            (scale.clone(), pic.clone(), scroll.clone(), pct.clone(), pending.clone());
+        let (scale, spacer, scroll, pct, pending) =
+            (scale.clone(), spacer.clone(), scroll.clone(), pct.clone(), pending.clone());
         let (hadj, vadj) = (hadj.clone(), vadj.clone());
         Rc::new(move |new, ax, ay| {
             let new = new.clamp(MIN_SCALE, MAX_SCALE);
@@ -65,7 +75,8 @@ pub fn show_image(tex: &gdk::Texture, name: &str) -> bool {
             let cx = (hadj.value() + ax - off(vw, tw * old)) / old;
             let cy = (vadj.value() + ay - off(vh, th * old)) / old;
             scale.set(new);
-            pic.set_size_request((tw * new).round().max(1.0) as i32, (th * new).round().max(1.0) as i32);
+            spacer.set_content_width((tw * new).round().max(1.0) as i32);
+            spacer.set_content_height((th * new).round().max(1.0) as i32);
             pct.set_label(&format!("{}%", (new * 100.0).round()));
             let target = (cx * new + off(vw, tw * new) - ax, cy * new + off(vh, th * new) - ay);
             pending.set((Some(target.0), Some(target.1)));
