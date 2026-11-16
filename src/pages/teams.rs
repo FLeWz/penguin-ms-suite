@@ -91,11 +91,11 @@ impl Prefs {
 /// Compact two-line chat entry: title, then a one-line preview.
 fn chat_info(title: &str, preview: &str, unread: bool) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    b.set_margin_top(3);
-    b.set_margin_bottom(3);
+    b.set_margin_top(2);
+    b.set_margin_bottom(2);
     b.set_margin_start(6);
     b.set_margin_end(4);
-    for (i, (text, classes)) in [(title, "chat-title"), (preview, "caption dim-label")].into_iter().enumerate() {
+    for (i, (text, classes)) in [(title, "chat-title"), (preview, "chat-preview dim-label")].into_iter().enumerate() {
         let l = gtk::Label::new(Some(text));
         l.set_xalign(0.0);
         l.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -115,7 +115,8 @@ fn chat_info(title: &str, preview: &str, unread: bool) -> gtk::Box {
 fn chat_menu(is_fav: bool, is_hidden: bool, on_fav: impl Fn() + 'static, on_hide: impl Fn() + 'static) -> gtk::MenuButton {
     let mb = gtk::MenuButton::new();
     mb.set_icon_name("view-more-symbolic");
-    for c in ["flat", "circular", "chat-menu", "quiet-icon"] {
+    mb.set_has_frame(false);
+    for c in ["chat-menu", "quiet-icon"] {
         mb.add_css_class(c);
     }
     mb.set_valign(gtk::Align::Center);
@@ -271,10 +272,13 @@ pub fn build() -> Page {
              .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
              .bubble-them { background: alpha(currentColor, 0.09); }
              .msg-scroll { transition: opacity 150ms ease-in; }
-             .chat-list row { min-height: 0; padding: 0 2px; }
-             .chat-title { font-size: 0.95em; }
+             .chat-list row { min-height: 0; padding: 0 2px; margin: 2px 4px; border-radius: 6px; }
+             .chat-title { font-size: 0.92em; }
+             .chat-preview { font-size: 0.75em; }
              .chat-title-unread { font-weight: 700; }
-             .chat-menu { opacity: 0; min-height: 0; min-width: 0; padding: 3px; margin-right: 2px; }
+             .chat-menu { opacity: 0; margin-right: 2px; }
+             .chat-menu button { min-height: 0; min-width: 0; padding: 2px; border-radius: 6px; }
+             .chat-menu image { -gtk-icon-size: 12px; }
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
              .thumb { transition: opacity 250ms ease-in; }
              .thumb-placeholder { background: alpha(currentColor, 0.07); border-radius: 8px; }
@@ -815,6 +819,9 @@ pub fn build() -> Page {
                     line.append(&dot);
                     let info = chat_info(&chat_title(c, &my_id), &prev, unread);
                     info.set_hexpand(true);
+                    info.set_valign(gtk::Align::Center);
+                    dot.set_valign(gtk::Align::Center);
+                    line.set_valign(gtk::Align::Center);
                     line.append(&info);
 
                     let toggle = {
