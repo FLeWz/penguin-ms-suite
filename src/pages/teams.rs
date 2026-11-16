@@ -128,6 +128,7 @@ fn is_unread(
 fn bubble(
     who: &str,
     text: &str,
+    markup: &str,
     when: &str,
     mine: bool,
     media: &[gtk::Widget],
@@ -147,7 +148,8 @@ fn bubble(
         b.append(w);
     }
     if !text.is_empty() {
-        let t = gtk::Label::new(Some(text));
+        let t = gtk::Label::new(None);
+        t.set_markup(markup);
         t.set_wrap(true);
         t.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         t.set_max_width_chars(60);
@@ -199,6 +201,7 @@ pub fn build() -> Page {
              .thumb-placeholder { background: alpha(currentColor, 0.07); border-radius: 8px; }
              .attach-chip { background: alpha(currentColor, 0.09); border-radius: 8px; padding: 2px 4px 2px 8px; }
              .drop-active { background: alpha(@accent_bg_color, 0.18); }
+             .bubble-me link, .bubble-me link:visited { color: @accent_fg_color; text-decoration: underline; }
              .link-card { background: alpha(currentColor, 0.08); border-left: 3px solid @accent_color; border-radius: 8px; padding: 6px 10px; margin-top: 4px; }
              .bubble-me .bubble-time { color: alpha(@accent_fg_color, 0.75); }",
         );
@@ -483,7 +486,11 @@ pub fn build() -> Page {
                         let mine = !my_id.is_empty()
                             && m["from"]["user"]["id"].as_str() == Some(my_id.as_str());
                         let when = finder::parse_time(m["createdDateTime"].as_str().unwrap_or("")).0;
-                        let r = bubble(who, &text, &when, mine, &media_widgets, &link_cards);
+                        let markup = util::message_markup(
+                            m["body"]["content"].as_str().unwrap_or(""),
+                            m["body"]["contentType"].as_str().unwrap_or("html"),
+                        );
+                        let r = bubble(who, &text, &markup, &when, mine, &media_widgets, &link_cards);
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
