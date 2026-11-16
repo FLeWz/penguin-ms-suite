@@ -449,6 +449,7 @@ pub fn build() -> Page {
              .chat-menu image { -gtk-icon-size: 12px; }
              .chat-list row:hover .chat-menu, .chat-list row:selected .chat-menu, .chat-menu:checked { opacity: 1; }
              .msg-selected { background: alpha(@accent_bg_color, 0.25); border-radius: 8px; }
+             .lightbox { background: alpha(black, 0.85); }
              .thumb { transition: opacity 250ms ease-in; }
              .thumb-placeholder { background: alpha(currentColor, 0.07); border-radius: 8px; }
              .attach-chip { background: alpha(currentColor, 0.09); border-radius: 8px; padding: 2px 4px 2px 8px; }

@@ -358,7 +358,11 @@ fn build_ui(app: &adw::Application) {
     let tv = adw::ToolbarView::new();
     tv.add_top_bar(&header);
     tv.set_content(Some(&root));
-    toasts.set_child(Some(&tv));
+    // Full-window layer for the in-app image viewer, below the toasts.
+    let layer = gtk::Overlay::new();
+    layer.set_child(Some(&tv));
+    pages::lightbox::set_host(&layer);
+    toasts.set_child(Some(&layer));
 
     let win = adw::ApplicationWindow::builder()
         .application(app)

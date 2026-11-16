@@ -648,6 +648,9 @@ fn viewer(parent: Option<&gtk::Window>, title: &str) -> gtk::Window {
 }
 
 fn open_image(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str) {
+    if super::lightbox::show_image(tex, name) {
+        return;
+    }
     let w = viewer(parent, name);
     let pic = gtk::Picture::for_paintable(tex);
     pic.set_content_fit(gtk::ContentFit::Contain);

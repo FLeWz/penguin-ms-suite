@@ -2,6 +2,7 @@ pub mod attach;
 pub mod calendar;
 pub mod excel;
 pub mod finder;
+pub mod lightbox;
 pub mod links;
 pub mod media;
 pub mod outlook;
