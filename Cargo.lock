@@ -878,6 +878,7 @@ name = "penguin-ms-suite"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "base64",
  "gtk4",
  "libadwaita",
  "serde",

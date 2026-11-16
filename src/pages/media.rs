@@ -31,6 +31,8 @@ const VIDEO_EXT: [&str; 6] = ["mp4", "mov", "mkv", "webm", "m4v", "avi"];
 enum Kind {
     Image,
     Video,
+    /// Any other attachment: a card that opens the link in the browser.
+    File,
 }
 
 #[derive(Clone)]
@@ -116,6 +118,8 @@ fn items(m: &Value) -> Vec<Item> {
             Kind::Image
         } else if VIDEO_EXT.contains(&ext.as_str()) {
             Kind::Video
+        } else if a["contentType"].as_str() == Some("reference") {
+            Kind::File
         } else {
             continue;
         };
@@ -146,6 +150,7 @@ impl Media {
             .map(|it| match it.kind {
                 Kind::Image => self.image_widget(it),
                 Kind::Video => self.video_widget(it),
+                Kind::File => file_widget(it),
             })
             .collect()
     }
@@ -243,6 +248,26 @@ impl Media {
         });
         b.upcast()
     }
+}
+
+/// Card for a non-media file attachment; click opens its link in the browser.
+fn file_widget(it: Item) -> gtk::Widget {
+    let b = gtk::Button::new();
+    b.add_css_class("flat");
+    b.add_css_class("quiet-icon");
+    b.set_halign(gtk::Align::Start);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.append(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
+    let l = gtk::Label::new(Some(&it.name));
+    l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    l.set_max_width_chars(40);
+    row.append(&l);
+    b.set_child(Some(&row));
+    b.set_tooltip_text(Some(&it.url));
+    b.connect_clicked(move |_| {
+        let _ = gtk::gio::AppInfo::launch_default_for_uri(&it.url, None::<&gtk::gio::AppLaunchContext>);
+    });
+    b.upcast()
 }
 
 fn clear(b: &gtk::Box) {

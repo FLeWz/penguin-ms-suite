@@ -1,3 +1,4 @@
+pub mod attach;
 pub mod calendar;
 pub mod excel;
 pub mod finder;

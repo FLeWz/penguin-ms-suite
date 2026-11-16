@@ -106,3 +106,21 @@ pub fn download(path: &str, dest: &std::path::Path, max: u64) -> Result<(), Stri
         }
     }
 }
+
+fn put_with(path: &str, send: impl FnOnce(ureq::RequestBuilder<ureq::typestate::WithBody>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
+    let req = bytes_agent(1800)
+        .put(format!("{BASE}{path}"))
+        .header("Authorization", format!("Bearer {}", auth::token()?))
+        .header("Content-Type", "application/octet-stream");
+    finish(send(req).map_err(|e| e.to_string())?)
+}
+
+/// Simple upload of a local file (Graph allows up to 250 MB this way).
+pub fn put_file(path: &str, file: &std::path::Path) -> Result<Value, String> {
+    let f = std::fs::File::open(file).map_err(|e| e.to_string())?;
+    put_with(path, |r| r.send(f))
+}
+
+pub fn put_bytes(path: &str, bytes: Vec<u8>) -> Result<Value, String> {
+    put_with(path, |r| r.send(bytes))
+}

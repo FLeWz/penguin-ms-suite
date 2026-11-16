@@ -1,4 +1,4 @@
-use super::{finder, links, media, Page};
+use super::{attach, finder, links, media, Page};
 use crate::relay;
 use crate::{graph, util};
 use adw::prelude::*;
@@ -195,6 +195,8 @@ pub fn build() -> Page {
              .bubble { border-radius: 14px; padding: 6px 10px; }
              .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
              .bubble-them { background: alpha(currentColor, 0.09); }
+             .attach-chip { background: alpha(currentColor, 0.09); border-radius: 8px; padding: 2px 4px 2px 8px; }
+             .drop-active { background: alpha(@accent_bg_color, 0.18); }
              .link-card { background: alpha(currentColor, 0.08); border-left: 3px solid @accent_color; border-radius: 8px; padding: 6px 10px; margin-top: 4px; }
              .bubble-me .bubble-time { color: alpha(@accent_fg_color, 0.75); }",
         );
@@ -234,6 +236,20 @@ pub fn build() -> Page {
         });
     }
     let compose = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let tray = attach::Tray::new();
+    let attach_btn = gtk::Button::from_icon_name("mail-attachment-symbolic");
+    attach_btn.add_css_class("flat");
+    attach_btn.add_css_class("quiet-icon");
+    attach_btn.set_tooltip_text(Some("Attach files (or drop / paste them)"));
+    attach_btn.set_valign(gtk::Align::Center);
+    {
+        let (tray, entry) = (tray.clone(), entry.clone());
+        attach_btn.connect_clicked(move |_| {
+            attach::pick_files(&tray, entry.root().and_downcast::<gtk::Window>());
+        });
+    }
+    attach::install_paste(&entry, &tray);
+    compose.append(&attach_btn);
     compose.append(&entry);
     compose.append(&emoji_btn);
     compose.set_margin_end(6);
@@ -322,8 +338,12 @@ pub fn build() -> Page {
     let link_previews = links::Links::new();
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
+    // chat id -> member user ids other than me (recipients when sharing uploaded files)
+    let chat_members: Rc<RefCell<HashMap<String, Vec<String>>>> = Default::default();
     right.append(&msg_scroll);
+    right.append(&tray.widget);
     right.append(&compose);
+    attach::install_drop(&right, &tray);
     right.set_hexpand(true);
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     let show_hidden = gtk::ToggleButton::with_label("Show hidden");
@@ -488,19 +508,60 @@ pub fn build() -> Page {
         });
     }
     {
-        let (current, load_msgs, stick) = (current.clone(), load_msgs.clone(), stick.clone());
+        let (current, load_msgs, stick, tray, chat_members, attach_btn) = (
+            current.clone(), load_msgs.clone(), stick.clone(), tray.clone(),
+            chat_members.clone(), attach_btn.clone(),
+        );
+        let sending = Rc::new(Cell::new(false));
         entry.connect_activate(move |e| {
-            let text = e.text().to_string();
-            let Some(id) = current.borrow().clone() else { return };
-            if text.trim().is_empty() {
+            if sending.get() {
                 return;
             }
-            e.set_text("");
+            let text = e.text().to_string();
+            let Some(id) = current.borrow().clone() else { return };
+            if text.trim().is_empty() && tray.is_empty() {
+                return;
+            }
             stick.set(true); // sending always follows to the newest message
-            let load_msgs = load_msgs.clone();
-            util::run_ok(
-                move || graph::post(&format!("/me/chats/{id}/messages"), &json!({"body": {"content": text}})),
-                move |_| load_msgs(),
+            if tray.is_empty() {
+                e.set_text("");
+                let load_msgs = load_msgs.clone();
+                util::run_ok(
+                    move || graph::post(&format!("/me/chats/{id}/messages"), &json!({"body": {"content": text}})),
+                    move |_| load_msgs(),
+                );
+                return;
+            }
+            // With attachments: upload, share, send. Keep text and files if it fails.
+            sending.set(true);
+            e.set_sensitive(false);
+            attach_btn.set_sensitive(false);
+            util::toast("Sending attachments…");
+            let files = tray.take();
+            let recipients = chat_members.borrow().get(&id).cloned().unwrap_or_default();
+            let (e, attach_btn, tray, load_msgs, sending) =
+                (e.clone(), attach_btn.clone(), tray.clone(), load_msgs.clone(), sending.clone());
+            util::run(
+                move || {
+                    let r = attach::send(&id, &text, &files, &recipients);
+                    (r, files)
+                },
+                move |(r, files)| {
+                    sending.set(false);
+                    e.set_sensitive(true);
+                    attach_btn.set_sensitive(true);
+                    match r {
+                        Ok(()) => {
+                            e.set_text("");
+                            load_msgs();
+                        }
+                        Err(err) => {
+                            tray.restore(files);
+                            util::toast(&err);
+                        }
+                    }
+                    e.grab_focus();
+                },
             );
         });
     }
@@ -527,8 +588,23 @@ pub fn build() -> Page {
             prefs.clone(), render_cell.clone(), show_hidden.clone(), titles.clone(),
         );
         let (read_local, fresh) = (read_local.clone(), fresh.clone());
+        let members_c = chat_members.clone();
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
+            {
+                let mut m = members_c.borrow_mut();
+                for c in &items {
+                    let ids: Vec<String> = c["members"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|x| x["userId"].as_str())
+                        .filter(|u| *u != my_id)
+                        .map(String::from)
+                        .collect();
+                    m.insert(c["id"].as_str().unwrap_or("").to_string(), ids);
+                }
+            }
             {
                 let mut t = titles.borrow_mut();
                 for c in &items {
