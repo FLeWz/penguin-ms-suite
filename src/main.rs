@@ -19,6 +19,95 @@ const APPS: [(&str, &str, Builder, &str); 4] = [
     ("Excel", "x-office-spreadsheet-symbolic", pages::excel::build, "Files.Read"),
 ];
 
+/// Softer light palette: off-white, warm greys instead of pure white. Only applied
+/// while the effective scheme is light (dark libadwaita colours are already muted).
+const SOFT_LIGHT: &str = "
+@define-color window_bg_color #e6e4df;
+@define-color window_fg_color #2e2e30;
+@define-color view_bg_color #edece8;
+@define-color view_fg_color #2e2e30;
+@define-color headerbar_bg_color #dad8d2;
+@define-color headerbar_fg_color #2e2e30;
+@define-color card_bg_color #f0efeb;
+@define-color popover_bg_color #edece8;
+@define-color dialog_bg_color #e6e4df;
+";
+
+#[derive(Clone, Copy, PartialEq)]
+enum Theme {
+    Dark,
+    Light,
+    System,
+}
+
+impl Theme {
+    fn path() -> std::path::PathBuf {
+        auth::dir().join("theme")
+    }
+    /// Default is dark: easiest on the eyes.
+    fn load() -> Self {
+        match std::fs::read_to_string(Self::path()).unwrap_or_default().trim() {
+            "light" => Theme::Light,
+            "system" => Theme::System,
+            _ => Theme::Dark,
+        }
+    }
+    fn save(self) {
+        let v = match self {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::System => "system",
+        };
+        let _ = std::fs::create_dir_all(auth::dir());
+        let _ = std::fs::write(Self::path(), v);
+    }
+    fn next(self) -> Self {
+        match self {
+            Theme::Dark => Theme::Light,
+            Theme::Light => Theme::System,
+            Theme::System => Theme::Dark,
+        }
+    }
+    fn apply(self) {
+        adw::StyleManager::default().set_color_scheme(match self {
+            Theme::Dark => adw::ColorScheme::ForceDark,
+            Theme::Light => adw::ColorScheme::ForceLight,
+            Theme::System => adw::ColorScheme::Default,
+        });
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Theme::Dark => "Theme: dark (click for light)",
+            Theme::Light => "Theme: light, soft (click for system)",
+            Theme::System => "Theme: follow system (click for dark)",
+        }
+    }
+}
+
+/// Install the soft-light override and keep it in sync with the effective scheme.
+fn install_soft_light() {
+    let Some(display) = gtk::gdk::Display::default() else { return };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(SOFT_LIGHT);
+    let sm = adw::StyleManager::default();
+    let sync = {
+        let (display, provider) = (display.clone(), provider.clone());
+        move |sm: &adw::StyleManager| {
+            if sm.is_dark() {
+                gtk::style_context_remove_provider_for_display(&display, &provider);
+            } else {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+        }
+    };
+    sync(&sm);
+    sm.connect_dark_notify(sync);
+}
+
 fn main() -> gtk::glib::ExitCode {
     // Cairo renderer: ~3x lower RSS than GL/Vulkan for this list/text UI.
     // Respect an explicit user choice.
@@ -179,7 +268,23 @@ fn build_ui(app: &adw::Application) {
             root.set_visible_child_name("login");
         });
     }
+    let theme = Rc::new(std::cell::Cell::new(Theme::load()));
+    let theme_btn = gtk::Button::from_icon_name("weather-clear-night-symbolic");
+    theme_btn.set_tooltip_text(Some(theme.get().label()));
+    {
+        let theme = theme.clone();
+        theme_btn.connect_clicked(move |b| {
+            let t = theme.get().next();
+            theme.set(t);
+            t.apply();
+            t.save();
+            b.set_tooltip_text(Some(t.label()));
+        });
+    }
+    install_soft_light();
+    theme.get().apply();
     header.pack_start(&refresh_btn);
+    header.pack_end(&theme_btn);
     header.pack_end(&out_btn);
 
     let toasts = adw::ToastOverlay::new();
