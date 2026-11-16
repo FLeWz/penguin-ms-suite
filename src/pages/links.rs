@@ -334,12 +334,18 @@ pub struct Links {
     previews: RefCell<HashMap<String, Option<Preview>>>,
     textures: RefCell<HashMap<String, gdk::Texture>>,
     inflight: RefCell<HashSet<String>>,
+    /// Called with (widget, height change) just before a placeholder changes size.
+    on_resize: RefCell<Option<Rc<dyn Fn(&gtk::Widget, f64)>>>,
 }
 
 impl Links {
     pub fn new() -> Rc<Self> {
         let enabled = std::env::var("PENGUIN_MS_LINK_PREVIEWS").map_or(true, |v| v != "0");
-        Rc::new(Links { enabled, previews: Default::default(), textures: Default::default(), inflight: Default::default() })
+        Rc::new(Links { enabled, previews: Default::default(), textures: Default::default(), inflight: Default::default(), on_resize: Default::default() })
+    }
+
+    pub fn set_on_resize(&self, f: Rc<dyn Fn(&gtk::Widget, f64)>) {
+        *self.on_resize.borrow_mut() = Some(f);
     }
 
     /// Preview cards for links in the message; cards appear when the fetch finishes.
@@ -377,6 +383,10 @@ impl Links {
                                     let Some((p, img)) = r else {
                                         me.previews.borrow_mut().insert(url, None);
                                         if let Some(h) = weak.upgrade() {
+                                            let f = me.on_resize.borrow().clone();
+                                            if let Some(f) = f {
+                                                f(h.upcast_ref(), -(CARD_H as f64));
+                                            }
                                             h.set_size_request(-1, -1); // no card: give the space back
                                             h.remove_css_class("thumb-placeholder");
                                         }

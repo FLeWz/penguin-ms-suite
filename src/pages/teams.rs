@@ -594,6 +594,12 @@ pub fn build() -> Page {
     let anchor: Anchor = Default::default();
     // Set while the list is rebuilt from scratch (rows, and so the anchor, are replaced).
     let anchor_frozen: Rc<Cell<bool>> = Default::default();
+    // True while the scroll value is being set by the app, not the user.
+    let programmatic: Rc<Cell<bool>> = Default::default();
+    // When the user last scrolled; anchor corrections wait while they are scrolling.
+    let last_input: Rc<Cell<Instant>> = Rc::new(Cell::new(Instant::now() - Duration::from_secs(10)));
+    // Apply the next anchor correction even if the user is scrolling (older page just arrived).
+    let force_restore: Rc<Cell<bool>> = Default::default();
     // Loads the next older page; filled in once `load_msgs` exists.
     let more_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
     {
@@ -601,14 +607,19 @@ pub fn build() -> Page {
             (stick.clone(), jump.clone(), rows.clone(), msgs.clone(), hold.clone());
         let prepend_c = prepend.clone();
         let anchor_c = anchor.clone();
-        let programmatic = Rc::new(Cell::new(false));
+        let (last_input, force_restore) = (last_input.clone(), force_restore.clone());
+        let programmatic = programmatic.clone();
         {
             let (stick, settling, programmatic) = (stick.clone(), settling.clone(), programmatic.clone());
             let more_cell = more_cell.clone();
             let (anchor, frozen, msgs) = (anchor.clone(), anchor_frozen.clone(), msgs.clone());
             let programmatic2 = programmatic.clone();
             let older_v = older.clone();
+            let last_input = last_input.clone();
             msg_scroll.vadjustment().connect_value_changed(move |a| {
+                if !programmatic2.get() {
+                    last_input.set(Instant::now());
+                }
                 // While an older page is on its way the anchor stays the message that was in
                 // view when the request was made.
                 let loading = older_v.try_borrow().map(|o| o.loading).unwrap_or(false);
@@ -642,6 +653,7 @@ pub fn build() -> Page {
             );
             let prepend = prepend_c.clone();
             let anchor = anchor_c.clone();
+            let (last_input, force) = (last_input.clone(), force_restore.clone());
             gtk::glib::idle_add_local_once(move || {
                 pending.set(false);
                 let target = jump.borrow().clone();
@@ -653,11 +665,19 @@ pub fn build() -> Page {
                     .and_then(|(w, off)| w.upgrade().and_then(|w| w.compute_bounds(&msgs)).map(|b| b.y() as f64 - off))
                     .filter(|_| !stick.get())
                 {
-                    // Keep the row that was in view at the same place on screen.
-                    if (a.value() - y).abs() > 0.5 {
+                    // Keep the row that was in view at the same place on screen, but never
+                    // fight the user: while they scroll, check again a moment later.
+                    let user_busy = last_input.get().elapsed() < Duration::from_millis(200) && !force.get();
+                    if user_busy {
+                        let a = a.clone();
+                        gtk::glib::timeout_add_local_once(Duration::from_millis(220), move || {
+                            a.emit_by_name::<()>("changed", &[]);
+                        });
+                    } else if (a.value() - y).abs() > 0.5 {
                         programmatic.set(true);
                         a.set_value(y);
                         programmatic.set(false);
+                        force.set(false);
                     }
                 } else if let Some((upper, value)) = prepend.get() {
                     programmatic.set(true);
@@ -702,6 +722,24 @@ pub fn build() -> Page {
     let media = media::Media::new();
     media.attach_viewport(&msg_scroll);
     let link_previews = links::Links::new();
+    {
+        // A link card placeholder that collapses above the row in view would shift the text:
+        // move the scroll value by the same amount in the same frame.
+        let (adj, anchor, msgs, stick, programmatic) =
+            (msg_scroll.vadjustment(), anchor.clone(), msgs.clone(), stick.clone(), programmatic.clone());
+        link_previews.set_on_resize(Rc::new(move |w: &gtk::Widget, delta: f64| {
+            if stick.get() {
+                return;
+            }
+            let ay = anchor.borrow().as_ref().and_then(|(a, _)| a.upgrade()).and_then(|a| a.compute_bounds(&msgs));
+            let (Some(ay), Some(wb)) = (ay, w.compute_bounds(&msgs)) else { return };
+            if (wb.y() + wb.height()) as f64 <= ay.y() as f64 + 0.5 {
+                programmatic.set(true);
+                adj.set_value(adj.value() + delta);
+                programmatic.set(false);
+            }
+        }));
+    }
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     // chat id -> member user ids other than me (recipients when sharing uploaded files)
@@ -834,6 +872,7 @@ pub fn build() -> Page {
         let drawn_c = drawn.clone();
         let (anchor_l, frozen_l) = (anchor.clone(), anchor_frozen.clone());
         let scroll_l = msg_scroll.clone();
+        let force_l = force_restore.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -854,6 +893,7 @@ pub fn build() -> Page {
             let drawn = drawn_c.clone();
             let (anchor, anchor_frozen) = (anchor_l.clone(), frozen_l.clone());
             let scroll_w = scroll_l.clone();
+            let force_restore = force_l.clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -897,6 +937,11 @@ pub fn build() -> Page {
                     }
                     let prepended = prepend.get().is_some();
                     if prepended {
+                        force_restore.set(true); // first correction must win over a scroll in progress
+                        gtk::glib::timeout_add_local_once(Duration::from_millis(1500), {
+                            let f = force_restore.clone();
+                            move || f.set(false)
+                        });
                         // Cleared after the rows are in (below), so the request-time anchor holds.
                         let older_d = older.clone();
                         gtk::glib::timeout_add_local_once(Duration::from_millis(300), move || {
