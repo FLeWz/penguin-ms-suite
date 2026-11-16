@@ -196,7 +196,7 @@ fn bubble(
     b.add_css_class("bubble");
     b.add_css_class(if mine { "bubble-me" } else { "bubble-them" });
     b.set_halign(if mine { gtk::Align::End } else { gtk::Align::Start });
-    if !mine {
+    if !mine && !who.is_empty() {
         let n = gtk::Label::new(Some(who));
         n.set_xalign(0.0);
         n.add_css_class("heading");
@@ -414,6 +414,8 @@ pub fn build() -> Page {
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     // chat id -> member user ids other than me (recipients when sharing uploaded files)
     let chat_members: Rc<RefCell<HashMap<String, Vec<String>>>> = Default::default();
+    // ids of one-on-one chats: their bubbles need no sender name
+    let one_on_one: Rc<RefCell<HashSet<String>>> = Default::default();
     // "Jump to newest" button, shown while scrolled up. Animates to the bottom and turns
     // follow mode back on.
     let jump_btn = gtk::Button::from_icon_name("go-down-symbolic");
@@ -525,6 +527,7 @@ pub fn build() -> Page {
         let me = me.clone();
         let media_c = media.clone();
         let links_c = link_previews.clone();
+        let one_c = one_on_one.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -539,6 +542,7 @@ pub fn build() -> Page {
             let my_id = me.borrow().clone();
             let media = media_c.clone();
             let link_previews = links_c.clone();
+            let is_one = one_c.borrow().contains(&id);
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -611,7 +615,7 @@ pub fn build() -> Page {
                             m["body"]["content"].as_str().unwrap_or(""),
                             m["body"]["contentType"].as_str().unwrap_or("html"),
                         );
-                        let r = bubble(who, &text, &markup, &when, mine, &media_widgets, &link_cards);
+                        let r = bubble(if is_one { "" } else { who }, &text, &markup, &when, mine, &media_widgets, &link_cards);
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
@@ -720,6 +724,7 @@ pub fn build() -> Page {
         );
         let (read_local, fresh) = (read_local.clone(), fresh.clone());
         let members_c = chat_members.clone();
+        let one_c = one_on_one.clone();
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
             {
@@ -735,6 +740,16 @@ pub fn build() -> Page {
                         .collect();
                     m.insert(c["id"].as_str().unwrap_or("").to_string(), ids);
                 }
+            }
+            {
+                let mut o = one_c.borrow_mut();
+                o.clear();
+                o.extend(
+                    items
+                        .iter()
+                        .filter(|c| c["chatType"].as_str() == Some("oneOnOne"))
+                        .filter_map(|c| c["id"].as_str().map(String::from)),
+                );
             }
             {
                 let mut t = titles.borrow_mut();
