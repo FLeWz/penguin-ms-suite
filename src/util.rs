@@ -71,6 +71,68 @@ pub fn strip_html(s: &str) -> String {
         .join(" ")
 }
 
+/// Message body -> text that keeps line breaks. HTML: <br>, </p>, </div>, <li>, headings
+/// and table rows become newlines and source newlines count as spaces. Plain text: newlines
+/// are kept. Spaces inside a line are collapsed; at most one blank line in a row.
+pub fn message_text(body: &str, content_type: &str) -> String {
+    let html = !content_type.eq_ignore_ascii_case("text");
+    let src = if html { body.replace(['\r', '\n'], " ") } else { body.replace('\r', "") };
+    let mut out = String::with_capacity(src.len());
+    if html {
+        let mut chars = src.chars();
+        while let Some(c) = chars.next() {
+            if c != '<' {
+                out.push(c);
+                continue;
+            }
+            let mut tag = String::new();
+            for t in chars.by_ref() {
+                if t == '>' {
+                    break;
+                }
+                tag.push(t);
+            }
+            let closing = tag.starts_with('/');
+            let name: String = tag
+                .trim_start_matches('/')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let breaks = match name.as_str() {
+                "br" => true,
+                "li" => !closing,
+                "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" => closing,
+                _ => false,
+            };
+            if breaks {
+                out.push('\n');
+            }
+        }
+    } else {
+        out = src;
+    }
+    let out = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    let mut lines: Vec<String> = vec![];
+    for l in out.split('\n') {
+        let l = l.split_whitespace().collect::<Vec<_>>().join(" ");
+        if l.is_empty() && lines.last().is_none_or(|p| p.is_empty()) {
+            continue; // collapse blank runs, drop leading blanks
+        }
+        lines.push(l);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 pub fn row(title: &str, sub: &str) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
     b.set_margin_top(6);
@@ -100,4 +162,20 @@ pub fn pane(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_text;
+
+    #[test]
+    fn html_breaks_become_newlines() {
+        assert_eq!(message_text("<p>one</p><p>two<br>three</p>", "html"), "one\ntwo\nthree");
+        assert_eq!(message_text("a &amp; b\n  c", "html"), "a & b c"); // source newline = space
+    }
+
+    #[test]
+    fn plain_text_keeps_newlines() {
+        assert_eq!(message_text("first\nsecond\n\n\n\nthird  x", "text"), "first\nsecond\n\nthird x");
+    }
 }

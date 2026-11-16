@@ -381,7 +381,10 @@ pub fn build() -> Page {
                     items.reverse(); // API returns newest first
                     for m in items {
                         let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
-                        let text = util::strip_html(m["body"]["content"].as_str().unwrap_or(""));
+                        let text = util::message_text(
+                            m["body"]["content"].as_str().unwrap_or(""),
+                            m["body"]["contentType"].as_str().unwrap_or("html"),
+                        );
                         if text.is_empty() {
                             continue;
                         }
