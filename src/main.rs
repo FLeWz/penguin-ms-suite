@@ -19,8 +19,8 @@ const APPS: [(&str, &str, Builder, &str); 4] = [
     ("Excel", "x-office-spreadsheet-symbolic", pages::excel::build, "Files.Read"),
 ];
 
-/// Softer light palette: off-white, warm greys instead of pure white. Only applied
-/// while the effective scheme is light (dark libadwaita colours are already muted).
+/// Softer light palette: off-white, warm greys instead of pure white. Applied only
+/// while the effective scheme is light.
 const SOFT_LIGHT: &str = "
 @define-color window_bg_color #e6e4df;
 @define-color window_fg_color #2e2e30;
@@ -32,6 +32,29 @@ const SOFT_LIGHT: &str = "
 @define-color popover_bg_color #edece8;
 @define-color dialog_bg_color #e6e4df;
 ";
+
+/// Softer dark palette: light-grey text instead of pure white, muted accent and
+/// status colours (blue bubbles, green unread dot) instead of saturated ones.
+const SOFT_DARK: &str = "
+@define-color window_fg_color #cfd0d3;
+@define-color view_fg_color #cfd0d3;
+@define-color headerbar_fg_color #cfd0d3;
+@define-color card_fg_color #cfd0d3;
+@define-color popover_fg_color #cfd0d3;
+@define-color accent_bg_color #3d5a80;
+@define-color accent_color #8aa8cc;
+@define-color accent_fg_color #e4e6ea;
+@define-color success_color #6c9a78;
+@define-color success_bg_color #3f6b4c;
+@define-color warning_color #c2a35e;
+@define-color error_color #c9777a;
+@define-color destructive_color #c9777a;
+@define-color destructive_bg_color #8a4a4d;
+";
+
+/// Applies to both schemes: the icon theme (e.g. Breeze) ships coloured icons for some of
+/// the names we use; render them neutral so they match the text colour.
+const ICON_CSS: &str = ".quiet-icon image { filter: grayscale(1) opacity(0.85); }";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Theme {
@@ -84,26 +107,18 @@ impl Theme {
     }
 }
 
-/// Install the soft-light override and keep it in sync with the effective scheme.
-fn install_soft_light() {
+/// Install the soft palettes and keep the right one active for the effective scheme.
+fn install_palettes() {
     let Some(display) = gtk::gdk::Display::default() else { return };
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(SOFT_LIGHT);
-    let sm = adw::StyleManager::default();
-    let sync = {
-        let (display, provider) = (display.clone(), provider.clone());
-        move |sm: &adw::StyleManager| {
-            if sm.is_dark() {
-                gtk::style_context_remove_provider_for_display(&display, &provider);
-            } else {
-                gtk::style_context_add_provider_for_display(
-                    &display,
-                    &provider,
-                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-                );
-            }
-        }
+    let (light, dark) = (gtk::CssProvider::new(), gtk::CssProvider::new());
+    light.load_from_data(&format!("{SOFT_LIGHT}{ICON_CSS}"));
+    dark.load_from_data(&format!("{SOFT_DARK}{ICON_CSS}"));
+    let sync = move |sm: &adw::StyleManager| {
+        let (on, off) = if sm.is_dark() { (&dark, &light) } else { (&light, &dark) };
+        gtk::style_context_remove_provider_for_display(&display, off);
+        gtk::style_context_add_provider_for_display(&display, on, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     };
+    let sm = adw::StyleManager::default();
     sync(&sm);
     sm.connect_dark_notify(sync);
 }
@@ -162,6 +177,7 @@ fn build_ui(app: &adw::Application) {
         b.set_icon_name(icon);
         b.set_tooltip_text(Some(name));
         b.add_css_class("flat");
+        b.add_css_class("quiet-icon");
         match &first {
             Some(f) => b.set_group(Some(f)),
             None => first = Some(b.clone()),
@@ -270,6 +286,7 @@ fn build_ui(app: &adw::Application) {
     }
     let theme = Rc::new(std::cell::Cell::new(Theme::load()));
     let theme_btn = gtk::Button::from_icon_name("weather-clear-night-symbolic");
+    theme_btn.add_css_class("quiet-icon");
     theme_btn.set_tooltip_text(Some(theme.get().label()));
     {
         let theme = theme.clone();
@@ -281,7 +298,7 @@ fn build_ui(app: &adw::Application) {
             b.set_tooltip_text(Some(t.label()));
         });
     }
-    install_soft_light();
+    install_palettes();
     theme.get().apply();
     header.pack_start(&refresh_btn);
     header.pack_end(&theme_btn);
