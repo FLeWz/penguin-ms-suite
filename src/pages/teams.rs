@@ -338,14 +338,7 @@ fn bubble(
     w.set_xalign(1.0);
     w.set_hexpand(true);
     w.set_valign(gtk::Align::Center);
-    // Bottom line: the hover add-reaction button on the left, time on the right.
-    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    if let Some(a) = add_react {
-        a.set_valign(gtk::Align::Center);
-        bottom.append(a);
-    }
-    bottom.append(&w);
-    b.append(&bottom);
+    b.append(&w);
 
     let outer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     outer.set_margin_top(3);
@@ -361,10 +354,23 @@ fn bubble(
     col.set_hexpand(true);
     col.set_halign(align);
     b.set_hexpand(false);
-    b.set_halign(align);
+    b.set_halign(gtk::Align::Fill);
+    // The add-reaction button floats over the bubble's top corner on hover; as an overlay it
+    // takes no space, so it never changes the bubble's size.
+    let ov = gtk::Overlay::new();
+    ov.add_css_class("msg-ov");
+    ov.set_halign(align);
+    ov.set_child(Some(&b));
+    if let Some(a) = add_react {
+        a.set_halign(gtk::Align::End);
+        a.set_valign(gtk::Align::Start);
+        a.set_margin_top(2);
+        a.set_margin_end(2);
+        ov.add_overlay(a);
+    }
     chips.add_css_class("react-straddle");
     chips.set_halign(align);
-    col.append(&b);
+    col.append(&ov);
     col.append(chips);
     outer.append(&col);
     outer
@@ -545,8 +551,8 @@ pub fn build() -> Page {
              .react-straddle { transform: translate(0, -11px); margin-left: 10px; margin-right: 10px; }
              .react-chip { min-height: 22px; min-width: 0; padding: 0 8px; border-radius: 999px; background: alpha(currentColor, 0.1); font-size: 0.85em; }
              .react-mine { background: alpha(@accent_bg_color, 0.35); }
-             .react-add { opacity: 0; min-height: 0; min-width: 0; padding: 1px; }
-             .bubble:hover .react-add, .react-add:checked { opacity: 1; }
+             .react-add { opacity: 0; min-height: 0; min-width: 0; padding: 2px; border-radius: 999px; background: alpha(black, 0.35); color: white; }
+             .msg-ov:hover .react-add, .react-add:checked { opacity: 1; }
              .msg-selected { background: alpha(@accent_bg_color, 0.25); border-radius: 8px; }
              .lightbox { background: alpha(black, 0.85); }
              .thumb { transition: opacity 250ms ease-in; }
