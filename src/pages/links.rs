@@ -43,6 +43,8 @@ struct Preview {
     description: String,
     site: String,
     image: Option<String>,
+    /// A video link (YouTube): larger thumbnail with a play badge.
+    video: bool,
 }
 
 // ---------- URL handling ----------
@@ -216,7 +218,57 @@ fn parse_page(url: &str, html: &str) -> Option<Preview> {
     let site = get(&["og:site_name"]).unwrap_or_else(|| host_of(url).unwrap_or("").to_string());
     let image = get(&["og:image", "og:image:url", "twitter:image"]).and_then(|i| resolve(url, &i));
     let cut = |s: String, n: usize| if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s };
-    Some(Preview { title: cut(title, 120), description: cut(description, 220), site, image })
+    Some(Preview { title: cut(title, 120), description: cut(description, 220), site, image, video: false })
+}
+
+/// 11-character video id of a YouTube watch, share, shorts, live or embed link.
+fn youtube_id(url: &str) -> Option<String> {
+    let host = host_of(url)?.to_ascii_lowercase();
+    let rest = url.split_once("://")?.1;
+    let after_host = rest.split_once(['/', '?', '#']).map_or("", |(_, r)| r);
+    let path = after_host.split(['?', '#']).next().unwrap_or("");
+    let first_seg = |p: &str| p.split('/').next().unwrap_or("").to_string();
+    let id = match host.as_str() {
+        "youtu.be" => first_seg(path),
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtube-nocookie.com"
+        | "www.youtube-nocookie.com" => {
+            if let Some(p) = ["shorts/", "embed/", "live/", "v/"].iter().find_map(|k| path.strip_prefix(k)) {
+                first_seg(p)
+            } else if path == "watch" {
+                let q = url.split_once('?')?.1.split('#').next()?;
+                q.split('&').find_map(|kv| kv.strip_prefix("v="))?.to_string()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    (id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).then_some(id)
+}
+
+/// YouTube via oEmbed: the watch page itself often returns a consent screen with no
+/// metadata, oEmbed returns title and channel reliably. Thumbnail comes from i.ytimg.com.
+fn youtube_preview(id: &str) -> Option<(Preview, Option<Vec<u8>>)> {
+    let watch = format!("https://www.youtube.com/watch?v={id}");
+    let api = format!("https://www.youtube.com/oembed?format=json&url={}", crate::graph::enc(&watch));
+    let (_, _, body) = fetch(&api, MAX_PAGE_BYTES).ok()?;
+    let v: Value = serde_json::from_slice(&body).ok()?;
+    let title = v["title"].as_str()?.to_string();
+    let thumb = format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg"); // 16:9, no letterbox bars
+    let img = fetch(&thumb, MAX_IMAGE_BYTES)
+        .ok()
+        .filter(|(_, ct, _)| ct.starts_with("image/"))
+        .map(|(_, _, b)| b);
+    Some((
+        Preview {
+            title,
+            description: v["author_name"].as_str().unwrap_or("").to_string(),
+            site: "YouTube".into(),
+            image: Some(thumb),
+            video: true,
+        },
+        img,
+    ))
 }
 
 // ---------- fetching ----------
@@ -258,6 +310,9 @@ fn fetch(url: &str, max: u64) -> Result<(String, String, Vec<u8>), String> {
 }
 
 fn fetch_preview(url: &str) -> Option<(Preview, Option<Vec<u8>>)> {
+    if let Some(id) = youtube_id(url) {
+        return youtube_preview(&id);
+    }
     let (final_url, ct, body) = fetch(url, MAX_PAGE_BYTES).ok()?;
     if !ct.contains("html") {
         return None;
@@ -336,13 +391,28 @@ impl Links {
         card.add_css_class("link-card");
         if let Some(t) = p.image.as_ref().and_then(|i| self.textures.borrow().get(i).cloned()) {
             let (w, h) = (t.width() as f64, t.height() as f64);
-            let s = (96.0 / w).min(96.0 / h).min(1.0);
+            let (maxw, maxh) = if p.video { (160.0, 90.0) } else { (96.0, 96.0) };
+            let s = (maxw / w).min(maxh / h).min(1.0);
             let pic = gtk::Picture::for_paintable(&t);
             pic.set_content_fit(gtk::ContentFit::Contain);
             pic.set_can_shrink(true);
             pic.set_size_request((w * s).max(1.0) as i32, (h * s).max(1.0) as i32);
             pic.set_valign(gtk::Align::Start);
-            card.append(&pic);
+            if p.video {
+                // Play badge centred on the thumbnail.
+                let ov = gtk::Overlay::new();
+                ov.set_child(Some(&pic));
+                let play = gtk::Image::from_icon_name("media-playback-start-symbolic");
+                play.set_pixel_size(20);
+                play.add_css_class("play-badge");
+                play.set_halign(gtk::Align::Center);
+                play.set_valign(gtk::Align::Center);
+                ov.add_overlay(&play);
+                ov.set_valign(gtk::Align::Start);
+                card.append(&ov);
+            } else {
+                card.append(&pic);
+            }
         }
         let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let label = |text: &str, class: Option<&str>, lines: i32| {
@@ -393,6 +463,30 @@ mod tests {
         }
         assert!(host_allowed("example.com"));
         assert!(host_allowed("93.184.216.34"));
+    }
+
+    #[test]
+    fn youtube_ids() {
+        let id = Some("dQw4w9WgXcQ".to_string());
+        for u in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com/watch?feature=share&v=dQw4w9WgXcQ&t=10",
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ#x",
+            "https://youtu.be/dQw4w9WgXcQ?si=abc",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ?feature=share",
+        ] {
+            assert_eq!(youtube_id(u), id, "{u}");
+        }
+        for u in [
+            "https://www.youtube.com/",
+            "https://www.youtube.com/watch?v=short",
+            "https://www.youtube.com/@channel",
+            "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+        ] {
+            assert_eq!(youtube_id(u), None, "{u}");
+        }
     }
 
     #[test]

@@ -202,6 +202,7 @@ pub fn build() -> Page {
              .attach-chip { background: alpha(currentColor, 0.09); border-radius: 8px; padding: 2px 4px 2px 8px; }
              .drop-active { background: alpha(@accent_bg_color, 0.18); }
              .bubble-me link, .bubble-me link:visited { color: @accent_fg_color; text-decoration: underline; }
+             .play-badge { background: alpha(black, 0.55); color: white; border-radius: 999px; padding: 8px; }
              .link-card { background: alpha(currentColor, 0.08); border-left: 3px solid @accent_color; border-radius: 8px; padding: 6px 10px; margin-top: 4px; }
              .bubble-me .bubble-time { color: alpha(@accent_fg_color, 0.75); }",
         );
