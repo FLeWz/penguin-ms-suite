@@ -1,4 +1,4 @@
-use super::{finder, media, Page};
+use super::{finder, links, media, Page};
 use crate::relay;
 use crate::{graph, util};
 use adw::prelude::*;
@@ -125,7 +125,14 @@ fn is_unread(
 }
 
 /// One chat message as a bubble: mine on the right (accent colour), others on the left.
-fn bubble(who: &str, text: &str, when: &str, mine: bool, media: &[gtk::Widget]) -> gtk::Box {
+fn bubble(
+    who: &str,
+    text: &str,
+    when: &str,
+    mine: bool,
+    media: &[gtk::Widget],
+    link_cards: &[gtk::Widget],
+) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
     b.add_css_class("bubble");
     b.add_css_class(if mine { "bubble-me" } else { "bubble-them" });
@@ -147,6 +154,9 @@ fn bubble(who: &str, text: &str, when: &str, mine: bool, media: &[gtk::Widget]) 
         t.set_xalign(0.0);
         t.set_selectable(true);
         b.append(&t);
+    }
+    for w in link_cards {
+        b.append(w);
     }
     let w = gtk::Label::new(Some(when));
     w.add_css_class("caption");
@@ -185,6 +195,7 @@ pub fn build() -> Page {
              .bubble { border-radius: 14px; padding: 6px 10px; }
              .bubble-me { background: @accent_bg_color; color: @accent_fg_color; }
              .bubble-them { background: alpha(currentColor, 0.09); }
+             .link-card { background: alpha(currentColor, 0.08); border-left: 3px solid @accent_color; border-radius: 8px; padding: 6px 10px; margin-top: 4px; }
              .bubble-me .bubble-time { color: alpha(@accent_fg_color, 0.75); }",
         );
         if let Some(d) = gtk::gdk::Display::default() {
@@ -308,6 +319,7 @@ pub fn build() -> Page {
     let chat_busy = Rc::new(Cell::new(false));
     let me: Rc<RefCell<String>> = Default::default(); // my user id, set by the chat list poll
     let media = media::Media::new();
+    let link_previews = links::Links::new();
     let index: finder::Index = Default::default();
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     right.append(&msg_scroll);
@@ -365,6 +377,7 @@ pub fn build() -> Page {
         let settling_c = settling.clone();
         let me = me.clone();
         let media_c = media.clone();
+        let links_c = link_previews.clone();
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
             let want = jump.borrow().clone();
@@ -378,6 +391,7 @@ pub fn build() -> Page {
             let settling = settling_c.clone();
             let my_id = me.borrow().clone();
             let media = media_c.clone();
+            let link_previews = links_c.clone();
             let cid = id.clone();
             util::run_ok(
                 move || {
@@ -439,13 +453,14 @@ pub fn build() -> Page {
                             m["body"]["contentType"].as_str().unwrap_or("html"),
                         );
                         let media_widgets = media.widgets(&m);
+                        let link_cards = link_previews.widgets(&m, &text);
                         if text.is_empty() && media_widgets.is_empty() {
                             continue;
                         }
                         let mine = !my_id.is_empty()
                             && m["from"]["user"]["id"].as_str() == Some(my_id.as_str());
                         let when = finder::parse_time(m["createdDateTime"].as_str().unwrap_or("")).0;
-                        let r = bubble(who, &text, &when, mine, &media_widgets);
+                        let r = bubble(who, &text, &when, mine, &media_widgets, &link_cards);
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
