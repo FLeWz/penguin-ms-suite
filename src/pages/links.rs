@@ -109,7 +109,7 @@ fn urls_of(m: &Value, text: &str) -> Vec<String> {
     let mut push = |u: &str| {
         let u = u.trim_end_matches(['.', ',', ')', ']', ';', '"', '\'', '>', '!']).replace("&amp;", "&");
         if let Some(h) = host_of(&u) {
-            if !out.contains(&u) && !skipped_host(h) && !is_media_url(&u) {
+            if !u.contains('…') && !out.contains(&u) && !skipped_host(h) && !is_media_url(&u) {
                 out.push(u);
             }
         }
@@ -121,7 +121,8 @@ fn urls_of(m: &Value, text: &str) -> Vec<String> {
         }
     }
     for tok in text.split_whitespace() {
-        if tok.starts_with("http://") || tok.starts_with("https://") {
+        // Teams shortens long link text to "https://host/path…": not a real URL.
+        if (tok.starts_with("http://") || tok.starts_with("https://")) && !tok.contains('…') {
             push(tok);
         }
     }
