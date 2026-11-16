@@ -206,6 +206,7 @@ fn menu_popover(
     on_fav: Rc<dyn Fn()>,
     on_hide: Rc<dyn Fn()>,
     on_delete: Rc<dyn Fn()>,
+    is_deleted: bool,
 ) -> gtk::Popover {
     let pop = gtk::Popover::new();
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -222,10 +223,15 @@ fn menu_popover(
         });
         b
     };
-    col.append(&item(if is_fav { "Remove from favourites" } else { "Add to favourites" }, on_fav));
-    col.append(&item(if is_hidden { "Unhide chat" } else { "Hide chat" }, on_hide));
-    col.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    col.append(&item("Delete chat…", on_delete));
+    if is_deleted {
+        // `on_delete` is the restore action for a deleted chat.
+        col.append(&item("Restore chat", on_delete));
+    } else {
+        col.append(&item(if is_fav { "Remove from favourites" } else { "Add to favourites" }, on_fav));
+        col.append(&item(if is_hidden { "Unhide chat" } else { "Hide chat" }, on_hide));
+        col.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        col.append(&item("Delete chat…", on_delete));
+    }
     pop.set_child(Some(&col));
     pop
 }
@@ -821,7 +827,7 @@ pub fn build() -> Page {
     attach::install_drop(&right, &tray);
     right.set_hexpand(true);
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-    let show_hidden = gtk::ToggleButton::with_label("Show hidden");
+    let show_hidden = gtk::ToggleButton::with_label("Show hidden and deleted");
     show_hidden.add_css_class("flat");
     show_hidden.set_margin_start(6);
     show_hidden.set_margin_end(6);
@@ -1305,16 +1311,14 @@ pub fn build() -> Page {
         let one_c = one_on_one.clone();
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
-            let items: Vec<Value> = {
+            // Deleted chats (still returned by the API) are split off; "Show hidden" lists them.
+            let (items, gone): (Vec<Value>, Vec<Value>) = {
                 let d = &prefs.borrow().deleted;
-                items
-                    .into_iter()
-                    .filter(|c| {
-                        let id = c["id"].as_str().unwrap_or("");
-                        let last = c["lastMessagePreview"]["id"].as_str().unwrap_or("");
-                        d.get(id).is_none_or(|at| at != last)
-                    })
-                    .collect()
+                items.into_iter().partition(|c| {
+                    let id = c["id"].as_str().unwrap_or("");
+                    let last = c["lastMessagePreview"]["id"].as_str().unwrap_or("");
+                    d.get(id).is_none_or(|at| at != last)
+                })
             };
             {
                 let mut m = members_c.borrow_mut();
@@ -1362,6 +1366,7 @@ pub fn build() -> Page {
                         vec![]
                     },
                 ),
+                ("DELETED", if show_hidden.is_active() { gone.iter().collect() } else { vec![] }),
             ];
 
             quiet.set(true);
@@ -1376,6 +1381,7 @@ pub fn build() -> Page {
                 for c in sel {
                     let cid = id_of(c);
                     let prev = util::strip_html(c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""));
+                    let is_deleted = label == "DELETED";
                     let is_fav = p.fav.contains(&cid);
                     let is_hidden = p.hidden.contains(&cid);
 
@@ -1418,7 +1424,28 @@ pub fn build() -> Page {
                     };
                     // Delete = hide the chat for me on the server (a user cannot delete a chat for
                     // everyone: that needs a tenant admin), after a confirmation.
-                    let on_delete: Rc<dyn Fn()> = {
+                    let restore: Rc<dyn Fn()> = {
+                        let (cid, my, prefs, render_cell) = (cid.clone(), my_id.clone(), prefs.clone(), render_cell.clone());
+                        Rc::new(move || {
+                            {
+                                let mut p = prefs.borrow_mut();
+                                p.deleted.remove(&cid);
+                                p.save();
+                            }
+                            // Best effort on the server; the list is already restored locally.
+                            if let Ok((_, tenant)) = crate::auth::config() {
+                                let body = json!({"user": {"id": my, "tenantId": tenant}});
+                                let cid = cid.clone();
+                                util::run(move || graph::post(&format!("/chats/{cid}/unhideForUser"), &body), |_| {});
+                            }
+                            util::toast("Chat restored");
+                            let f = render_cell.borrow().clone();
+                            if let Some(f) = f {
+                                gtk::glib::idle_add_local_once(move || f());
+                            }
+                        })
+                    };
+                    let on_delete: Rc<dyn Fn()> = if is_deleted { restore } else {
                         let title = chat_title(c, &my_id);
                         let pid = c["lastMessagePreview"]["id"].as_str().unwrap_or("").to_string();
                         let (cid, my, deleted, render_cell, current, msgs_d) =
@@ -1478,10 +1505,10 @@ pub fn build() -> Page {
                     let (t1, t2) = (toggle.clone(), toggle);
                     let fav_cb: Rc<dyn Fn()> = Rc::new(move || t1(true));
                     let hide_cb: Rc<dyn Fn()> = Rc::new(move || t2(false));
-                    let menu = chat_menu(&menu_popover(is_fav, is_hidden, fav_cb.clone(), hide_cb.clone(), on_delete.clone()));
+                    let menu = chat_menu(&menu_popover(is_fav, is_hidden, fav_cb.clone(), hide_cb.clone(), on_delete.clone(), is_deleted));
                     line.append(&menu);
                     // Right click: the same menu, opened at the pointer.
-                    let ctx = menu_popover(is_fav, is_hidden, fav_cb, hide_cb, on_delete);
+                    let ctx = menu_popover(is_fav, is_hidden, fav_cb, hide_cb, on_delete, is_deleted);
                     ctx.set_parent(&line);
                     ctx.set_has_arrow(false);
                     ctx.set_halign(gtk::Align::Start);
