@@ -172,7 +172,30 @@ fn remember_window(win: &adw::ApplicationWindow) {
     });
 }
 
+/// glibc malloc tuning. Worker threads each get their own arena and large freed buffers
+/// (image bytes, decoded pixels) stay mapped, which cost 30-60 MB RSS in a busy chat. One
+/// arena, early trimming and mmap for big blocks return the memory to the system.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_malloc() {
+    unsafe extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    const M_MMAP_THRESHOLD: i32 = -3;
+    const M_ARENA_MAX: i32 = -8;
+    // SAFETY: plain glibc call, made before any other thread exists.
+    unsafe {
+        mallopt(M_ARENA_MAX, 1);
+        mallopt(M_TRIM_THRESHOLD, 64 * 1024);
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_malloc() {}
+
 fn main() -> gtk::glib::ExitCode {
+    tune_malloc();
     // Cairo renderer: ~3x lower RSS than GL/Vulkan for this list/text UI.
     // Respect an explicit user choice.
     if std::env::var_os("GSK_RENDERER").is_none() {
