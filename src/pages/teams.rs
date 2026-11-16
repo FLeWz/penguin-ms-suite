@@ -793,6 +793,8 @@ pub fn build() -> Page {
     let titles: Rc<RefCell<HashMap<String, String>>> = Default::default();
     // chat id -> member user ids other than me (recipients when sharing uploaded files)
     let chat_members: Rc<RefCell<HashMap<String, Vec<String>>>> = Default::default();
+    // user id -> display name of everyone in the chat list (names for reactions)
+    let member_names: reactions::Names = Default::default();
     // ids of one-on-one chats: their bubbles need no sender name
     let one_on_one: Rc<RefCell<HashSet<String>>> = Default::default();
     {
@@ -919,6 +921,7 @@ pub fn build() -> Page {
         let sel_c = msg_sel.clone();
         let (older_c, prepend_c, more_c) = (older.clone(), prepend.clone(), more_cell.clone());
         let drawn_c = drawn.clone();
+        let names_l = member_names.clone();
         let (anchor_l, frozen_l) = (anchor.clone(), anchor_frozen.clone());
         let scroll_l = msg_scroll.clone();
         let force_l = force_restore.clone();
@@ -940,6 +943,7 @@ pub fn build() -> Page {
             let sel = sel_c.clone();
             let (older, prepend, more_cell) = (older_c.clone(), prepend_c.clone(), more_c.clone());
             let drawn = drawn_c.clone();
+            let names = names_l.clone();
             let (anchor, anchor_frozen) = (anchor_l.clone(), frozen_l.clone());
             let scroll_w = scroll_l.clone();
             let force_restore = force_l.clone();
@@ -1071,7 +1075,7 @@ pub fn build() -> Page {
                             m["body"]["contentType"].as_str().unwrap_or("html"),
                         );
                         let (reactor, react_row, react_spacer) =
-                            reactions::Reactor::new(&cid, m["id"].as_str().unwrap_or(""), &my_id);
+                            reactions::Reactor::new(&cid, m["id"].as_str().unwrap_or(""), &my_id, names.clone());
                         reactor.refresh(&m["reactions"]);
                         let r = bubble(
                             if is_one { "" } else { who },
@@ -1370,8 +1374,19 @@ pub fn build() -> Page {
         let (read_local, fresh) = (read_local.clone(), fresh.clone());
         let members_c = chat_members.clone();
         let one_c = one_on_one.clone();
+        let names_c = member_names.clone();
         Rc::new(move || {
             let (my_id, items) = cache.borrow().clone();
+            {
+                let mut n = names_c.borrow_mut();
+                for c in &items {
+                    for m in c["members"].as_array().into_iter().flatten() {
+                        if let (Some(id), Some(name)) = (m["userId"].as_str(), m["displayName"].as_str()) {
+                            n.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
+            }
             // Deleted chats (still returned by the API) are split off; "Show hidden" lists them.
             let (items, gone): (Vec<Value>, Vec<Value>) = {
                 let d = &prefs.borrow().deleted;

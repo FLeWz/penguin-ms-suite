@@ -41,10 +41,14 @@ pub fn sig(reactions: &Value) -> u64 {
     h.finish()
 }
 
+/// User id -> display name, for the people in the chat list (reactions carry only ids).
+pub type Names = Rc<RefCell<HashMap<String, String>>>;
+
 pub struct Reactor {
     chat: String,
     message: String,
     my_id: String,
+    names: Names,
     chips: gtk::Box,
     spacer: gtk::Widget,
     /// Reaction shown -> the raw type to send to remove it, for the reactions I made.
@@ -55,7 +59,7 @@ impl Reactor {
     /// Returns the reactor, the row with the chips and the hover "add reaction" button (it is
     /// laid over the bubble's bottom edge), and a spacer that reserves the room under the
     /// bubble for the half of the row that sticks out, only while there are chips.
-    pub fn new(chat: &str, message: &str, my_id: &str) -> (Rc<Self>, gtk::Box, gtk::Widget) {
+    pub fn new(chat: &str, message: &str, my_id: &str, names: Names) -> (Rc<Self>, gtk::Box, gtk::Widget) {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         spacer.set_size_request(-1, 11);
@@ -65,6 +69,7 @@ impl Reactor {
             chat: chat.to_string(),
             message: message.to_string(),
             my_id: my_id.to_string(),
+            names,
             chips: chips.clone(),
             spacer: spacer.clone().upcast(),
             mine: Default::default(),
@@ -105,22 +110,28 @@ impl Reactor {
         self.mine.borrow_mut().clear();
         // emoji -> (count, my raw type), in first-seen order
         let mut order: Vec<String> = vec![];
-        let mut groups: HashMap<String, (usize, Option<String>)> = HashMap::new();
+        let mut groups: HashMap<String, (usize, Option<String>, Vec<String>)> = HashMap::new();
+        let names = self.names.borrow();
         for r in reactions.as_array().into_iter().flatten() {
             let raw = r["reactionType"].as_str().unwrap_or("");
             let Some(e) = display(raw) else { continue };
             let g = groups.entry(e.clone()).or_insert_with(|| {
                 order.push(e.clone());
-                (0, None)
+                (0, None, vec![])
             });
             g.0 += 1;
-            if !self.my_id.is_empty() && r["user"]["user"]["id"].as_str() == Some(self.my_id.as_str()) {
+            let uid = r["user"]["user"]["id"].as_str().unwrap_or("");
+            if !self.my_id.is_empty() && uid == self.my_id {
                 g.1 = Some(raw.to_string());
+                g.2.insert(0, "You".to_string()); // yourself first
+            } else {
+                g.2.push(names.get(uid).cloned().unwrap_or_else(|| "Someone".to_string()));
             }
         }
         for e in order {
-            let (n, mine) = groups[&e].clone();
+            let (n, mine, who) = groups[&e].clone();
             let b = gtk::Button::with_label(&format!("{e} {n}"));
+            b.set_tooltip_text(Some(&who.join(", ")));
             b.add_css_class("react-chip");
             if mine.is_some() {
                 b.add_css_class("react-mine");
