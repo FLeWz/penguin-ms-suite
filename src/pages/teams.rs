@@ -303,6 +303,8 @@ pub fn build() -> Page {
     // Latest message id seen per chat, to detect new arrivals. Empty until first load.
     let seen: Rc<RefCell<HashMap<String, String>>> = Default::default();
     let me: Rc<RefCell<String>> = Default::default();
+    // False until the first successful poll: that one only records state, no notifications.
+    let primed = Rc::new(std::cell::Cell::new(false));
     let signature: Rc<RefCell<String>> = Default::default();
     let cache: Rc<RefCell<(String, Vec<Value>)>> = Default::default(); // (my id, chats)
     let prefs = Rc::new(RefCell::new(Prefs::load()));
@@ -412,12 +414,14 @@ pub fn build() -> Page {
 
     let do_refresh: Rc<dyn Fn(bool)> = {
         let pending_c = pending.clone();
+        let primed_c = primed.clone();
         let (chats, current, load_msgs, seen, me, signature, cache, prefs, render) = (
             chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
             signature.clone(), cache.clone(), prefs.clone(), render.clone(),
         );
         Rc::new(move |polling: bool| {
             let pending = pending_c.clone();
+            let primed = primed_c.clone();
             let (chats, current, load_msgs, seen, me2, signature, cache, prefs, render) = (
                 chats.clone(), current.clone(), load_msgs.clone(), seen.clone(), me.clone(),
                 signature.clone(), cache.clone(), prefs.clone(), render.clone(),
@@ -454,7 +458,7 @@ pub fn build() -> Page {
                     }
 
                     // New-message detection.
-                    let first_load = seen.borrow().is_empty();
+                    let first_load = !primed.get();
                     let mut new_in_current = false;
                     for c in &items {
                         let cid = c["id"].as_str().unwrap_or("");
@@ -494,6 +498,8 @@ pub fn build() -> Page {
                             }
                         }
                     }
+
+                    primed.set(true);
 
                     // Re-render only when something visible changed.
                     let sig: String = items
