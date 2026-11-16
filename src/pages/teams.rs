@@ -106,6 +106,8 @@ fn chat_info(title: &str, preview: &str, unread: bool) -> gtk::Box {
         if unread && i == 0 {
             l.add_css_class("chat-title-unread");
         }
+        // A chat without a preview shows only the title, centred in the row.
+        l.set_visible(!text.is_empty());
         b.append(&l);
     }
     b
