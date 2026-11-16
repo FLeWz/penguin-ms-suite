@@ -111,19 +111,16 @@ fn chat_info(title: &str, preview: &str, unread: bool) -> gtk::Box {
     b
 }
 
-/// "⋮" menu with the favourite and hide actions. The same popover opens on right click.
-fn chat_menu(is_fav: bool, is_hidden: bool, on_fav: impl Fn() + 'static, on_hide: impl Fn() + 'static) -> gtk::MenuButton {
-    let mb = gtk::MenuButton::new();
-    mb.set_icon_name("view-more-symbolic");
-    mb.set_has_frame(false);
-    for c in ["chat-menu", "quiet-icon"] {
-        mb.add_css_class(c);
-    }
-    mb.set_valign(gtk::Align::Center);
-    mb.set_tooltip_text(Some("Chat actions"));
+/// Popover with the favourite and hide actions for one chat.
+fn menu_popover(
+    is_fav: bool,
+    is_hidden: bool,
+    on_fav: Rc<dyn Fn()>,
+    on_hide: Rc<dyn Fn()>,
+) -> gtk::Popover {
     let pop = gtk::Popover::new();
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let item = |label: &str, cb: Box<dyn Fn()>| {
+    let item = |label: &str, cb: Rc<dyn Fn()>| {
         let b = gtk::Button::with_label(label);
         b.add_css_class("flat");
         if let Some(l) = b.child().and_downcast::<gtk::Label>() {
@@ -136,10 +133,23 @@ fn chat_menu(is_fav: bool, is_hidden: bool, on_fav: impl Fn() + 'static, on_hide
         });
         b
     };
-    col.append(&item(if is_fav { "Remove from favourites" } else { "Add to favourites" }, Box::new(on_fav)));
-    col.append(&item(if is_hidden { "Unhide chat" } else { "Hide chat" }, Box::new(on_hide)));
+    col.append(&item(if is_fav { "Remove from favourites" } else { "Add to favourites" }, on_fav));
+    col.append(&item(if is_hidden { "Unhide chat" } else { "Hide chat" }, on_hide));
     pop.set_child(Some(&col));
-    mb.set_popover(Some(&pop));
+    pop
+}
+
+/// Small "⋮" button that opens `pop`.
+fn chat_menu(pop: &gtk::Popover) -> gtk::MenuButton {
+    let mb = gtk::MenuButton::new();
+    mb.set_icon_name("view-more-symbolic");
+    mb.set_has_frame(false);
+    for c in ["chat-menu", "quiet-icon"] {
+        mb.add_css_class(c);
+    }
+    mb.set_valign(gtk::Align::Center);
+    mb.set_tooltip_text(Some("Chat actions"));
+    mb.set_popover(Some(pop));
     mb
 }
 
@@ -844,18 +854,27 @@ pub fn build() -> Page {
                         })
                     };
                     let (t1, t2) = (toggle.clone(), toggle);
-                    let menu = chat_menu(is_fav, is_hidden, move || t1(true), move || t2(false));
+                    let fav_cb: Rc<dyn Fn()> = Rc::new(move || t1(true));
+                    let hide_cb: Rc<dyn Fn()> = Rc::new(move || t2(false));
+                    let menu = chat_menu(&menu_popover(is_fav, is_hidden, fav_cb.clone(), hide_cb.clone()));
                     line.append(&menu);
-                    // Right click anywhere on the entry opens the same menu.
+                    // Right click: the same menu, opened at the pointer.
+                    let ctx = menu_popover(is_fav, is_hidden, fav_cb, hide_cb);
+                    ctx.set_parent(&line);
+                    ctx.set_has_arrow(false);
+                    ctx.set_halign(gtk::Align::Start);
                     let rc = gtk::GestureClick::new();
                     rc.set_button(3);
-                    let menu_w = menu.downgrade();
-                    rc.connect_pressed(move |_, _, _, _| {
-                        if let Some(m) = menu_w.upgrade() {
-                            m.popup();
-                        }
-                    });
+                    {
+                        let ctx = ctx.clone();
+                        rc.connect_pressed(move |_, _, x, y| {
+                            ctx.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                            ctx.popup();
+                        });
+                    }
                     line.add_controller(rc);
+                    // A popover parented to a widget must be unparented before the widget dies.
+                    line.connect_destroy(move |_| ctx.unparent());
                     chats.append(&line);
                     order.push(cid);
                 }
