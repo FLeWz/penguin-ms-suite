@@ -598,6 +598,8 @@ pub fn build() -> Page {
              .react-add button { min-height: 0; min-width: 0; padding: 3px; border-radius: 999px; background: alpha(black, 0.35); color: white; }
              .react-add image { -gtk-icon-size: 12px; }
              .msg-stack:hover .react-add, .react-add:checked { opacity: 1; }
+             .compose-box { border: 1px solid alpha(currentColor, 0.2); border-radius: 8px; }
+             .compose-text, .compose-text text { background: transparent; }
              .msg-selected { background: alpha(@accent_bg_color, 0.25); border-radius: 8px; }
              .lightbox { background: alpha(black, 0.85); }
              .thumb { transition: opacity 250ms ease-in; }
@@ -619,15 +621,44 @@ pub fn build() -> Page {
     let msgs = gtk::ListBox::new();
     msgs.set_selection_mode(gtk::SelectionMode::None);
     msgs.add_css_class("message-list");
-    let entry = gtk::Entry::new();
-    entry.set_placeholder_text(Some("Type a message…"));
-    entry.set_margin_top(6);
-    entry.set_margin_bottom(6);
-    entry.set_margin_start(6);
-    entry.set_margin_end(6);
-    entry.set_hexpand(true);
-    // Type ":smile" for emoji completion; Ctrl+. also opens GTK's chooser in the entry.
-    entry.set_property("enable-emoji-completion", true);
+    // Multi-line message box: Enter sends, Shift+Enter adds a line. It grows with its text up
+    // to about six lines, then scrolls. Ctrl+. opens GTK's emoji chooser.
+    let entry = gtk::TextView::new();
+    entry.set_wrap_mode(gtk::WrapMode::WordChar);
+    entry.set_accepts_tab(false);
+    entry.set_top_margin(6);
+    entry.set_bottom_margin(6);
+    entry.set_left_margin(8);
+    entry.set_right_margin(8);
+    entry.add_css_class("compose-text");
+    let hint = gtk::Label::new(Some("Type a message…   (Shift+Enter: new line)"));
+    hint.add_css_class("dim-label");
+    hint.set_halign(gtk::Align::Start);
+    hint.set_valign(gtk::Align::Start);
+    hint.set_margin_top(6);
+    hint.set_margin_start(8);
+    hint.set_can_target(false);
+    {
+        let hint = hint.clone();
+        entry.buffer().connect_changed(move |b| hint.set_visible(b.char_count() == 0));
+    }
+    let entry_scroll = gtk::ScrolledWindow::builder()
+        .child(&entry)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .min_content_height(34)
+        .max_content_height(140)
+        .hexpand(true)
+        .build();
+    entry_scroll.add_css_class("compose-box");
+    let entry_ov = gtk::Overlay::new();
+    entry_ov.set_child(Some(&entry_scroll));
+    entry_ov.add_overlay(&hint);
+    entry_ov.set_margin_top(6);
+    entry_ov.set_margin_bottom(6);
+    entry_ov.set_margin_start(6);
+    entry_ov.set_margin_end(6);
+    entry_ov.set_hexpand(true);
     let emoji_btn = gtk::MenuButton::new();
     emoji_btn.set_icon_name("face-smile-symbolic");
     emoji_btn.add_css_class("flat");
@@ -644,10 +675,8 @@ pub fn build() -> Page {
             let chooser = gtk::EmojiChooser::new();
             let entry = entry.clone();
             chooser.connect_emoji_picked(move |_, emoji| {
-                let mut pos = entry.position();
-                entry.insert_text(emoji, &mut pos);
-                entry.set_position(pos);
-                entry.grab_focus_without_selecting();
+                entry.buffer().insert_at_cursor(emoji);
+                entry.grab_focus();
             });
             btn.set_popover(Some(&chooser));
         });
@@ -667,7 +696,7 @@ pub fn build() -> Page {
     }
     attach::install_paste(&entry, &tray);
     compose.append(&attach_btn);
-    compose.append(&entry);
+    compose.append(&entry_ov);
     compose.append(&emoji_btn);
     compose.set_margin_end(6);
 
@@ -1478,18 +1507,19 @@ pub fn build() -> Page {
             chat_members.clone(), attach_btn.clone(),
         );
         let sending = Rc::new(Cell::new(false));
-        entry.connect_activate(move |e| {
+        let send = Rc::new(move |e: &gtk::TextView| {
             if sending.get() {
                 return;
             }
-            let text = e.text().to_string();
+            let buf = e.buffer();
+            let text = buf.text(&buf.start_iter(), &buf.end_iter(), false).trim_end().to_string();
             let Some(id) = current.borrow().clone() else { return };
             if text.trim().is_empty() && tray.is_empty() {
                 return;
             }
             stick.set(true); // sending always follows to the newest message
             if tray.is_empty() {
-                e.set_text("");
+                e.buffer().set_text("");
                 let load_msgs = load_msgs.clone();
                 util::run_ok(
                     move || graph::post(&format!("/me/chats/{id}/messages"), &json!({"body": {"contentType": "html", "content": attach::html_body(&text)}})),
@@ -1517,7 +1547,7 @@ pub fn build() -> Page {
                     attach_btn.set_sensitive(true);
                     match r {
                         Ok(()) => {
-                            e.set_text("");
+                            e.buffer().set_text("");
                             load_msgs();
                         }
                         Err(err) => {
@@ -1529,6 +1559,20 @@ pub fn build() -> Page {
                 },
             );
         });
+        // Enter sends, Shift+Enter (or Ctrl+Enter) inserts a line break.
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let e = entry.clone();
+        key.connect_key_pressed(move |_, k, _, state| {
+            if matches!(k, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                && !state.intersects(gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::CONTROL_MASK)
+            {
+                send(&e);
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        entry.add_controller(key);
     }
 
     // Latest message id seen per chat, to detect new arrivals. Empty until first load.

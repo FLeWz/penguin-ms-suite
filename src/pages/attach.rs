@@ -248,7 +248,7 @@ pub fn install_drop(target: &impl IsA<gtk::Widget>, tray: &Rc<Tray>) {
 /// Ctrl+V / Shift+Insert in the message bar: pasted files or images are staged; plain text
 /// still pastes normally. Files win over text (file managers also put paths on the clipboard);
 /// an image is taken only when there is no text (a copied spreadsheet range has both).
-pub fn install_paste(entry: &gtk::Entry, tray: &Rc<Tray>) {
+pub fn install_paste(entry: &gtk::TextView, tray: &Rc<Tray>) {
     use gtk::gdk::Key;
     let key = gtk::EventControllerKey::new();
     key.set_propagation_phase(gtk::PropagationPhase::Capture);
