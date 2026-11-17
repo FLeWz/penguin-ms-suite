@@ -47,6 +47,24 @@ pub fn post(path: &str, body: &Value) -> Result<Value, String> {
     finish(r)
 }
 
+pub fn patch(path: &str, body: &Value) -> Result<Value, String> {
+    let r = agent()
+        .patch(format!("{BASE}{path}"))
+        .header("Authorization", format!("Bearer {}", auth::token()?))
+        .send_json(body)
+        .map_err(|e| e.to_string())?;
+    finish(r)
+}
+
+pub fn delete(path: &str) -> Result<(), String> {
+    let r = agent()
+        .delete(format!("{BASE}{path}"))
+        .header("Authorization", format!("Bearer {}", auth::token()?))
+        .call()
+        .map_err(|e| e.to_string())?;
+    finish(r).map(|_| ())
+}
+
 /// Percent-encode a query value.
 pub fn enc(s: &str) -> String {
     let mut o = String::new();

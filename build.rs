@@ -16,6 +16,13 @@ fn main() {
             }
         }
     }
+    // Optional: relay URL (public) and invite secret (extractable from the binary; prefer the
+    // runtime variable or ~/.config/penguin-ms-suite/relay_invite for anything shared).
+    for key in ["PENGUIN_MS_RELAY_URL", "PENGUIN_MS_RELAY_INVITE"] {
+        println!("cargo:rerun-if-env-changed={key}");
+        let val = std::env::var(key).ok().or_else(|| vars.get(key).cloned()).unwrap_or_default();
+        println!("cargo:rustc-env=BUILTIN_{key}={val}");
+    }
     for key in ["PENGUIN_MS_CLIENT_ID", "PENGUIN_MS_TENANT"] {
         println!("cargo:rerun-if-env-changed={key}");
         let val = std::env::var(key)
