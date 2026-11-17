@@ -2140,7 +2140,12 @@ pub fn build() -> Page {
                     }
                     let Some(newest) = v["value"][0]["id"].as_str() else { return };
                     let known = live_last.borrow().get(&cid).cloned();
-                    if known.is_some_and(|k| k != newest) {
+                    // Also redraw when a message was edited or got a reaction (the cache sync
+                    // reports it), not only when a new message arrived.
+                    let edited = v["changed"].as_bool().unwrap_or(false);
+                    if known.is_some() && edited && known.as_deref() == Some(newest) {
+                        load_msgs();
+                    } else if known.is_some_and(|k| k != newest) {
                         // Mark seen so the list poll does not notify for the chat on screen.
                         seen.borrow_mut().insert(cid.clone(), newest.to_string());
                         load_msgs();

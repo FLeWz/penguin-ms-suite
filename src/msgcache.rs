@@ -233,6 +233,7 @@ fn serve(chat: &str, top: usize, before: Option<&str>) -> Value {
 /// Newest messages: first fill, or fetch only what changed since the last sync.
 fn first(chat: &str, top: usize) -> Result<Value, String> {
     let sync = with_store(chat, |s| s.sync.clone());
+    let mut changed = false;
     if sync.is_empty() {
         let v = graph::get(&format!("/me/chats/{chat}/messages?$top={PAGE}&$orderby=createdDateTime%20desc"))?;
         let more = v["@odata.nextLink"].is_string();
@@ -261,25 +262,31 @@ fn first(chat: &str, top: usize) -> Result<Value, String> {
                 }
             }
         }
-        with_store(chat, |s| {
+        changed = with_store(chat, |s| {
             if !finished {
                 *s = Store::default(); // too far behind; refill from scratch next time
-                return;
+                return false;
             }
+            let mut changed = false;
             for m in &got {
                 // Older, never-cached messages would leave a hole in the cache; they are
                 // fetched later when the user scrolls back.
-                let known = m["id"].as_str().is_some_and(|i| s.msgs.contains_key(i));
-                if known || s.complete || ts(created(m)) >= ts(&s.oldest) {
+                let old = m["id"].as_str().and_then(|i| s.msgs.get(i));
+                if old.is_some() || s.complete || ts(created(m)) >= ts(&s.oldest) {
+                    changed |= old.is_none_or(|o| o["lastModifiedDateTime"] != m["lastModifiedDateTime"]);
                     s.put(m);
                 }
             }
+            changed
         });
         if !finished {
             return Err("cache fell too far behind".into());
         }
     }
-    Ok(serve(chat, top, None))
+    let mut out = serve(chat, top, None);
+    // New, edited or reacted-to messages came in with this sync (callers redraw on it).
+    out["changed"] = json!(changed);
+    Ok(out)
 }
 
 /// Older history: from disk when cached, otherwise one API page extends the cache.
