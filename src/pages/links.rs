@@ -284,7 +284,22 @@ fn agent() -> ureq::Agent {
 }
 
 /// GET with up to 4 manually checked redirects. Returns (final url, content type, body).
+/// Bytes of a public image URL (same host and redirect checks as link previews, no login).
+pub(crate) fn fetch_image(url: &str, max: u64) -> Result<Vec<u8>, String> {
+    // Giphy answers a browser-style Accept (text/html first) with its web page: ask for images.
+    let (_, ct, body) = fetch_accept(url, max, "image/gif,image/*;q=0.9")?;
+    if ct.starts_with("image/") {
+        Ok(body)
+    } else {
+        Err(format!("not an image ({ct})"))
+    }
+}
+
 fn fetch(url: &str, max: u64) -> Result<(String, String, Vec<u8>), String> {
+    fetch_accept(url, max, "text/html,image/*;q=0.8")
+}
+
+fn fetch_accept(url: &str, max: u64, accept: &str) -> Result<(String, String, Vec<u8>), String> {
     let agent = agent();
     let mut cur = url.to_string();
     for _ in 0..5 {
@@ -292,7 +307,7 @@ fn fetch(url: &str, max: u64) -> Result<(String, String, Vec<u8>), String> {
         if !host_allowed(host) {
             return Err("blocked host".into());
         }
-        let r = agent.get(&cur).header("Accept", "text/html,image/*;q=0.8").call().map_err(|e| e.to_string())?;
+        let r = agent.get(&cur).header("Accept", accept).call().map_err(|e| e.to_string())?;
         let code = r.status().as_u16();
         if (300..400).contains(&code) {
             let loc = r.headers().get("location").and_then(|v| v.to_str().ok()).ok_or("redirect without location")?;

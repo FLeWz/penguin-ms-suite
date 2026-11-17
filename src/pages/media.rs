@@ -46,6 +46,8 @@ struct Item {
     /// Hosted-content URL (graph.microsoft.com) or SharePoint/OneDrive link.
     url: String,
     shared_file: bool,
+    /// A public image on a GIF service (Giphy, Tenor) sent from the Teams GIF picker.
+    external: bool,
     /// Pixel size from the message HTML (`width`/`height`), to reserve space before loading.
     dims: Option<(f64, f64)>,
 }
@@ -53,7 +55,9 @@ struct Item {
 impl Item {
     /// Graph path (relative to the v1.0 base) that returns the bytes.
     fn api_path(&self) -> String {
-        if self.shared_file {
+        if self.external {
+            self.url.clone()
+        } else if self.shared_file {
             format!("/shares/u!{}/driveItem/content", auth::b64url(self.url.as_bytes()))
         } else {
             self.url.strip_prefix(graph::BASE).unwrap_or(&self.url).to_string()
@@ -98,6 +102,15 @@ fn tag_dims(tag: &str) -> Option<(f64, f64)> {
     Some((tag_dim(tag, "width")?, tag_dim(tag, "height")?))
 }
 
+/// Only GIF services are loaded from outside Microsoft: an arbitrary <img> URL would let any
+/// sender make this app contact their server.
+fn is_gif_service(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("").rsplit('@').next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    ["giphy.com", "tenor.com", "tenor.co"].iter().any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -138,8 +151,19 @@ fn items(m: &Value) -> Vec<Item> {
     for part in html.split("<img").skip(1) {
         let tag = part.split('>').next().unwrap_or("");
         let Some(src) = tag.split("src=\"").nth(1).and_then(|r| r.split('"').next()) else { continue };
-        if src.starts_with(graph::BASE) && src.contains("/hostedContents/") {
-            out.push(Item { kind: Kind::Image, name: "image.png".into(), url: src.to_string(), shared_file: false, dims: tag_dims(tag) });
+        if is_gif_service(src) {
+            // The Teams GIF picker sends <img src="https://media3.giphy.com/.../giphy.gif">.
+            let name = src.split(['?', '#']).next().and_then(|u| u.rsplit('/').next()).filter(|n| !n.is_empty());
+            out.push(Item {
+                kind: Kind::Image,
+                name: name.unwrap_or("animation.gif").to_string(),
+                url: src.to_string(),
+                shared_file: false,
+                external: true,
+                dims: tag_dims(tag),
+            });
+        } else if src.starts_with(graph::BASE) && src.contains("/hostedContents/") {
+            out.push(Item { kind: Kind::Image, name: "image.png".into(), url: src.to_string(), shared_file: false, external: false, dims: tag_dims(tag) });
         }
     }
     // Files shared as references (OneDrive / SharePoint).
@@ -155,7 +179,7 @@ fn items(m: &Value) -> Vec<Item> {
         } else {
             continue;
         };
-        out.push(Item { kind, name: name.to_string(), url: url.to_string(), shared_file: true, dims: None });
+        out.push(Item { kind, name: name.to_string(), url: url.to_string(), shared_file: true, external: false, dims: None });
     }
     out
 }
@@ -166,6 +190,8 @@ pub struct Attachment {
     pub name: String,
     /// Graph path that returns the bytes.
     pub api: String,
+    /// `api` is a public URL, not a Graph path.
+    pub external: bool,
     /// Local copy location (used if already downloaded).
     pub cache: PathBuf,
 }
@@ -174,7 +200,16 @@ pub type ForwardFn = Rc<dyn Fn(&gtk::Widget, Attachment)>;
 
 impl Item {
     fn attachment(&self) -> Attachment {
-        Attachment { name: self.name.clone(), api: self.api_path(), cache: self.cache_path() }
+        Attachment { name: self.name.clone(), api: self.api_path(), external: self.external, cache: self.cache_path() }
+    }
+}
+
+fn download_attachment(a: &Attachment, dest: &std::path::Path) -> Result<(), String> {
+    if a.external {
+        let bytes = super::links::fetch_image(&a.api, MAX_IMAGE_BYTES)?;
+        std::fs::write(dest, bytes).map_err(|e| e.to_string())
+    } else {
+        graph::download(&a.api, dest, MAX_VIDEO_BYTES)
     }
 }
 
@@ -184,7 +219,7 @@ pub fn fetch_to_cache(a: &Attachment) -> Result<(), String> {
         return Ok(());
     }
     std::fs::create_dir_all(a.cache.parent().unwrap_or(&a.cache)).map_err(|e| e.to_string())?;
-    graph::download(&a.api, &a.cache, MAX_VIDEO_BYTES)
+    download_attachment(a, &a.cache)
 }
 
 /// Open with the default app: download to the cache first when needed.
@@ -214,7 +249,7 @@ fn save_as(w: &gtk::Widget, a: Attachment) {
                 if a.cache.exists() {
                     std::fs::copy(&a.cache, &dest).map(|_| ()).map_err(|e| e.to_string())
                 } else {
-                    graph::download(&a.api, &dest, MAX_VIDEO_BYTES)
+                    download_attachment(&a, &dest)
                 }
             },
             move |r| match r {
@@ -511,6 +546,7 @@ impl Media {
         }
         let (me, key, path, name) = (self.clone(), key.to_string(), it.api_path(), it.name.clone());
         let file = it.cache_path();
+        let external = it.external;
         let it_file = file.clone();
         util::run(
             // Fetch and decode off the UI thread so big photos do not stall scrolling.
@@ -519,7 +555,11 @@ impl Media {
                 if let Some(t) = file.exists().then(|| decode_thumb(&file)).flatten() {
                     return Ok(SendTexture(t));
                 }
-                let bytes = graph::get_bytes(&path, MAX_IMAGE_BYTES)?;
+                let bytes = if external {
+                    super::links::fetch_image(&path, MAX_IMAGE_BYTES)?
+                } else {
+                    graph::get_bytes(&path, MAX_IMAGE_BYTES)?
+                };
                 // Keep the original on disk (for the viewer) and decode only a thumbnail.
                 let on_disk = std::fs::create_dir_all(file.parent().unwrap_or(&file)).is_ok()
                     && std::fs::write(&file, &bytes).is_ok();
