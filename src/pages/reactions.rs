@@ -3,6 +3,7 @@
 //! `POST /chats/{chat}/messages/{message}/setReaction` and `unsetReaction` (Chat.ReadWrite).
 use crate::{graph, util};
 use adw::prelude::*;
+use gtk::gdk;
 use serde_json::{json, Value};
 use std::{
     cell::RefCell,
@@ -24,11 +25,57 @@ fn display(kind: &str) -> Option<String> {
             "surprised" => "😮",
             "sad" => "🙁",
             "angry" => "😠",
-            "custom" | "" => return None,
+            "" => return None,
             other => other,
         }
         .to_string(),
     )
+}
+
+const CUSTOM_PX: i32 = 18; // custom emoji size in a chip
+const MAX_CUSTOM: usize = 64; // decoded custom emoji kept
+
+thread_local! {
+    /// Decoded custom emoji by content URL (they repeat across messages and redraws).
+    static CUSTOM: RefCell<HashMap<String, gdk::Texture>> = RefCell::new(HashMap::new());
+}
+
+/// Chip content for a custom emoji: the image, loaded with the Graph token (the URL is a
+/// hostedContents link), at a fixed size so the chip does not change size when it arrives.
+fn custom_image(url: &str) -> gtk::Picture {
+    let pic = gtk::Picture::new();
+    pic.set_size_request(CUSTOM_PX, CUSTOM_PX);
+    pic.set_content_fit(gtk::ContentFit::Contain);
+    pic.set_can_shrink(true);
+    pic.set_valign(gtk::Align::Center);
+    if let Some(t) = CUSTOM.with(|c| c.borrow().get(url).cloned()) {
+        pic.set_paintable(Some(&t));
+        return pic;
+    }
+    let (weak, key) = (pic.downgrade(), url.to_string());
+    let path = url.strip_prefix(graph::BASE).unwrap_or(url).to_string();
+    util::run(
+        move || {
+            let bytes = graph::get_bytes(&path, 2 * 1024 * 1024).ok()?;
+            super::media::decode_scaled(&bytes, CUSTOM_PX * 2, CUSTOM_PX * 2).map(super::media::SendTexture)
+        },
+        move |r| {
+            let Some(super::media::SendTexture(t)) = r else { return };
+            CUSTOM.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.len() >= MAX_CUSTOM {
+                    if let Some(k) = c.keys().next().cloned() {
+                        c.remove(&k); // evict one, never clear (that reloads everything on screen)
+                    }
+                }
+                c.insert(key, t.clone());
+            });
+            if let Some(p) = weak.upgrade() {
+                p.set_paintable(Some(&t));
+            }
+        },
+    );
+    pic
 }
 
 /// Fingerprint of a message's reactions, to notice changes without rebuilding the row.
@@ -142,14 +189,23 @@ impl Reactor {
         self.mine.borrow_mut().clear();
         // emoji -> (count, my raw type), in first-seen order
         let mut order: Vec<String> = vec![];
-        let mut groups: HashMap<String, (usize, Option<String>, Vec<String>)> = HashMap::new();
+        // (count, my raw type, people, custom emoji url)
+        let mut groups: HashMap<String, (usize, Option<String>, Vec<String>, Option<String>)> = HashMap::new();
         let names = self.names.borrow();
         for r in reactions.as_array().into_iter().flatten() {
             let raw = r["reactionType"].as_str().unwrap_or("");
-            let Some(e) = display(raw) else { continue };
+            let Some(shown) = display(raw) else { continue };
+            // Custom emoji: no character, grouped by name, drawn from reactionContentUrl.
+            let custom = raw == "custom";
+            let e = if custom {
+                format!("custom:{}", r["displayName"].as_str().unwrap_or(""))
+            } else {
+                shown
+            };
+            let url = custom.then(|| r["reactionContentUrl"].as_str().map(String::from)).flatten();
             let g = groups.entry(e.clone()).or_insert_with(|| {
                 order.push(e.clone());
-                (0, None, vec![])
+                (0, None, vec![], url.clone())
             });
             g.0 += 1;
             let uid = r["user"]["user"]["id"].as_str().unwrap_or("");
@@ -161,17 +217,33 @@ impl Reactor {
             }
         }
         for e in order {
-            let (n, mine, who) = groups[&e].clone();
-            let b = gtk::Button::with_label(&format!("{e} {n}"));
-            b.set_tooltip_text(Some(&who.join(", ")));
+            let (n, mine, who, url) = groups[&e].clone();
+            let b = gtk::Button::new();
+            let tip = who.join(", ");
+            if let Some(name) = e.strip_prefix("custom:") {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                match &url {
+                    Some(u) => row.append(&custom_image(u)),
+                    None => row.append(&gtk::Label::new(Some("⬚"))),
+                }
+                row.append(&gtk::Label::new(Some(&n.to_string())));
+                b.set_child(Some(&row));
+                b.set_tooltip_text(Some(&format!("{name}\n{tip}")));
+            } else {
+                b.set_label(&format!("{e} {n}"));
+                b.set_tooltip_text(Some(&tip));
+            }
             b.add_css_class("react-chip");
             if mine.is_some() {
                 b.add_css_class("react-mine");
                 self.mine.borrow_mut().insert(e.clone(), mine.unwrap_or_default());
             }
-            let me = self.clone();
-            let was_mine = self.mine.borrow().contains_key(&e);
-            b.connect_clicked(move |_| me.toggle(&e, !was_mine));
+            if !e.starts_with("custom:") {
+                // Custom emoji cannot be set from here: Graph has no list of them to pick from.
+                let me = self.clone();
+                let was_mine = self.mine.borrow().contains_key(&e);
+                b.connect_clicked(move |_| me.toggle(&e, !was_mine));
+            }
             self.chips.append(&b);
         }
         let any = self.chips.first_child().is_some();
