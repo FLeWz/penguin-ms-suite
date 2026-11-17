@@ -48,15 +48,20 @@ own token. Message content never touches the relay.
 
 ## 3. Graph subscription details [verify all]
 
-- Resource: `/me/chats/getAllMessages` (delegated). Narrower alternative:
-  `/chats/{id}/messages` per chat (one subscription per chat, more to renew).
+- Resource: `/users/{my-user-id}/chats/getAllMessages` (delegated, all chats of the
+  signed-in user; checked against the Graph docs: `/me/chats/getAllMessages` and
+  `/chats/getAllMessages` are application-only). Narrower alternative:
+  `/chats/{id}/messages` per chat (delegated `Chat.Read`; one subscription per chat,
+  more to renew).
 - Permission: `Chat.Read` or `Chat.ReadWrite` (delegated). The penguin app
   already has `Chat.ReadWrite`.
 - `changeType`: `created,updated`.
 - `includeResourceData: false`. The notification then carries only resource
   ids. This avoids the encryption-certificate requirement that comes with
   resource data, and keeps content off the relay.
-- Max subscription lifetime for chat messages is short (about 60 minutes).
+- Max subscription lifetime for chat messages is short (about 60 minutes). A lifetime
+  over 1 hour is only accepted with a `lifecycleNotificationUrl` (documented); the
+  upper limit with it (believed 3 days) is still [verify].
   Renew with `PATCH /subscriptions/{id}` at roughly half the lifetime.
 - `clientState`: random secret per subscription. The relay checks it on every
   notification and drops mismatches.
