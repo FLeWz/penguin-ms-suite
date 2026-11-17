@@ -1492,7 +1492,7 @@ pub fn build() -> Page {
                 e.set_text("");
                 let load_msgs = load_msgs.clone();
                 util::run_ok(
-                    move || graph::post(&format!("/me/chats/{id}/messages"), &json!({"body": {"content": text}})),
+                    move || graph::post(&format!("/me/chats/{id}/messages"), &json!({"body": {"contentType": "html", "content": attach::html_body(&text)}})),
                     move |_| load_msgs(),
                 );
                 return;

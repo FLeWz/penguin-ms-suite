@@ -293,6 +293,39 @@ pub fn install_paste(entry: &gtk::Entry, tray: &Rc<Tray>) {
 
 // ---------- sending (worker thread) ----------
 
+/// Message text as Teams HTML: escaped, line breaks kept, and bare `http(s)://` and `www.`
+/// addresses turned into `<a href>` links. A plain-text body is not linked by Teams.
+pub fn html_body(text: &str) -> String {
+    let mut out = String::from("<p>");
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push_str("<br>");
+        }
+        let mut first = true;
+        for word in line.split(' ') {
+            if !first {
+                out.push(' ');
+            }
+            first = false;
+            let url_start = word.starts_with("http://") || word.starts_with("https://") || word.starts_with("www.");
+            if !url_start {
+                out.push_str(&esc(word));
+                continue;
+            }
+            let url = word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"']);
+            let host_ok = url.split_once("://").map_or(url, |(_, r)| r).len() > 3;
+            if !host_ok {
+                out.push_str(&esc(word));
+                continue;
+            }
+            let href = if url.starts_with("www.") { format!("https://{url}") } else { url.to_string() };
+            out.push_str(&format!("<a href=\"{}\">{}</a>{}", esc(&href), esc(url), esc(&word[url.len()..])));
+        }
+    }
+    out.push_str("</p>");
+    out
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -327,7 +360,7 @@ fn upload(f: &Staged) -> Result<Value, String> {
 pub fn send(chat_id: &str, text: &str, files: &[Staged], recipients: &[String]) -> Result<(), String> {
     let mut html = String::new();
     if !text.trim().is_empty() {
-        html.push_str(&format!("<p>{}</p>", esc(text).replace('\n', "<br>")));
+        html.push_str(&html_body(text));
     }
     let (mut hosted, mut atts) = (vec![], vec![]);
     for (i, f) in files.iter().enumerate() {
@@ -396,6 +429,16 @@ mod tests {
         let item = json!({"eTag": "\"{1F2E3D4C-0000-4AAA-8BBB-0123456789AB},3\""});
         assert_eq!(attachment_id(&item), "1f2e3d4c00004aaa8bbb0123456789ab");
         assert_eq!(attachment_id(&json!({})).len(), 32); // random fallback
+    }
+
+    #[test]
+    fn urls_become_links_and_text_is_escaped() {
+        assert_eq!(
+            html_body("see https://a.com/x?q=1&r=2. ok\nwww.b.org, <b>"),
+            "<p>see <a href=\"https://a.com/x?q=1&amp;r=2\">https://a.com/x?q=1&amp;r=2</a>. ok<br>\
+             <a href=\"https://www.b.org\">www.b.org</a>, &lt;b&gt;</p>"
+        );
+        assert_eq!(html_body("https:// alone"), "<p>https:// alone</p>");
     }
 
     #[test]
