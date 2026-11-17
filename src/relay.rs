@@ -280,6 +280,10 @@ fn session(url: &str, dev: &Device, tx: &async_channel::Sender<PushEvent>) -> En
             Ok(Message::Text(t)) => {
                 last_seen = Instant::now();
                 let v: Value = serde_json::from_str(t.as_str()).unwrap_or(Value::Null);
+                if std::env::var_os("PENGUIN_MS_DEBUG").is_some() && v["type"].as_str() != Some("heartbeat") {
+                    // Ids only, never message content.
+                    eprintln!("relay: event {} chat={} message={}", v["type"], v["chatId"], v["messageId"]);
+                }
                 match v["type"].as_str() {
                     Some("message") => {
                         if let Some(c) = v["chatId"].as_str() {
