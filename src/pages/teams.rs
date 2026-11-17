@@ -301,6 +301,28 @@ fn is_unread(
     server || fresh.contains(cid)
 }
 
+/// "New messages" line shown above the first message that was unread when the chat was opened.
+fn unread_line() -> gtk::Box {
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    b.set_margin_top(6);
+    b.set_margin_bottom(2);
+    b.set_margin_start(12);
+    b.set_margin_end(12);
+    b.add_css_class("unread-line");
+    let sep = || {
+        let s = gtk::Separator::new(gtk::Orientation::Horizontal);
+        s.set_hexpand(true);
+        s.set_valign(gtk::Align::Center);
+        s
+    };
+    let l = gtk::Label::new(Some("New messages"));
+    l.add_css_class("caption-heading");
+    b.append(&sep());
+    b.append(&l);
+    b.append(&sep());
+    b
+}
+
 /// One chat message as a bubble: mine on the right (accent colour), others on the left.
 fn bubble(
     who: &str,
@@ -559,6 +581,8 @@ pub fn build() -> Page {
              .chat-list row { min-height: 0; padding: 0 2px; margin: 2px 4px; border-radius: 6px; }
              .chat-preview { font-size: 0.75em; }
              .chat-title-unread { font-weight: 700; }
+             .unread-line separator { background-color: @error_color; min-height: 1px; }
+             .unread-line label { color: @error_color; }
              .chat-menu { opacity: 0; margin-right: 14px; } /* clear of the overlay scrollbar */
              .chat-menu button { min-height: 0; min-width: 0; padding: 2px; border-radius: 6px; }
              .chat-menu image { -gtk-icon-size: 12px; }
@@ -929,6 +953,13 @@ pub fn build() -> Page {
     // Suppresses the selection handler while the list is rebuilt programmatically.
     let quiet = Rc::new(std::cell::Cell::new(false));
     let current: Rc<RefCell<Option<String>>> = Default::default();
+    let cache: Rc<RefCell<(String, Vec<Value>)>> = Default::default(); // (my id, chats)
+    // Unread tracking: chat -> last message id opened here; chats with new messages this session.
+    let read_local: Rc<RefCell<HashMap<String, String>>> = Default::default();
+    let fresh: Rc<RefCell<HashSet<String>>> = Default::default();
+    // (chat, read marker when it was opened while unread): the "New messages" line goes above
+    // the first message newer than the marker. Taken before the chat is marked read.
+    let divider: Rc<RefCell<Option<(String, String)>>> = Default::default();
 
     let load_msgs = {
         let (msgs, current, stick, index, titles, jump, rows, apply_jump) = (
@@ -949,8 +980,25 @@ pub fn build() -> Page {
         let (anchor_l, frozen_l) = (anchor.clone(), anchor_frozen.clone());
         let scroll_l = msg_scroll.clone();
         let force_l = force_restore.clone();
+        let (cache_l, read_l, fresh_l, divider_l) =
+            (cache.clone(), read_local.clone(), fresh.clone(), divider.clone());
         Rc::new(move || {
             let Some(id) = current.borrow().clone() else { return };
+            // First load of a chat opened while unread: remember the server's read marker
+            // now, before the chat gets marked read.
+            {
+                let mut d = divider_l.borrow_mut();
+                if d.as_ref().is_none_or(|(c, _)| *c != id) {
+                    let (my, items) = &*cache_l.borrow();
+                    *d = items
+                        .iter()
+                        .find(|c| c["id"].as_str() == Some(id.as_str()))
+                        .filter(|c| is_unread(c, my, &read_l.borrow(), &fresh_l.borrow()))
+                        .and_then(|c| c["viewpoint"]["lastMessageReadDateTime"].as_str())
+                        .map(|m| (id.clone(), m.to_string()));
+                }
+            }
+            let divider = divider_l.clone();
             let want = jump.borrow().clone();
             let title = titles.borrow().get(&id).cloned().unwrap_or_default();
             let (msgs, stick, index, jump, rows, apply_jump, current) = (
@@ -1088,6 +1136,23 @@ pub fn build() -> Page {
                             Some((m["id"].as_str().unwrap_or("").to_string(), h.finish(), text, m))
                         })
                         .collect();
+                    // First message from someone else newer than the read marker (see `divider`).
+                    let first_unread: Option<String> = divider
+                        .borrow()
+                        .as_ref()
+                        .filter(|(c, _)| *c == cid)
+                        .and_then(|(_, marker)| {
+                            let since = finder::parse_time(marker).1;
+                            entries
+                                .iter()
+                                .find(|e| {
+                                    let from_me = !my_id.is_empty()
+                                        && e.3["from"]["user"]["id"].as_str() == Some(my_id.as_str());
+                                    !from_me
+                                        && finder::parse_time(e.3["createdDateTime"].as_str().unwrap_or("")).1 > since
+                                })
+                                .map(|e| e.0.clone())
+                        });
                     let make_row = |text: &str, m: &Value| -> (gtk::Box, String, (u64, Rc<reactions::Reactor>)) {
                         let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
                         let media_widgets = media.widgets(m);
@@ -1112,6 +1177,14 @@ pub fn build() -> Page {
                             &react_row,
                             &react_spacer,
                         );
+                        let r = if m["id"].as_str().is_some() && m["id"].as_str() == first_unread.as_deref() {
+                            let w = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                            w.append(&unread_line());
+                            w.append(&r);
+                            w
+                        } else {
+                            r
+                        };
                         if let Some(mid) = m["id"].as_str() {
                             rows.borrow_mut().insert(mid.to_string(), r.clone().upcast());
                         }
@@ -1299,8 +1372,8 @@ pub fn build() -> Page {
         }));
     }
     {
-        let (ids, current, load_msgs, quiet) =
-            (ids.clone(), current.clone(), load_msgs.clone(), quiet.clone());
+        let (ids, current, load_msgs, quiet, divider) =
+            (ids.clone(), current.clone(), load_msgs.clone(), quiet.clone(), divider.clone());
         chats.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             if quiet.get() {
@@ -1310,6 +1383,7 @@ pub fn build() -> Page {
             if id.is_none() {
                 return;
             }
+            *divider.borrow_mut() = None; // taken again on this chat's first load
             *current.borrow_mut() = id;
             load_msgs();
         });
@@ -1378,16 +1452,12 @@ pub fn build() -> Page {
     // False until the first successful poll: that one only records state, no notifications.
     let primed = Rc::new(std::cell::Cell::new(false));
     let signature: Rc<RefCell<String>> = Default::default();
-    let cache: Rc<RefCell<(String, Vec<Value>)>> = Default::default(); // (my id, chats)
     let prefs = Rc::new(RefCell::new(Prefs::load()));
     // Chats just created from search: they have no messages yet, so the chat
     // list API may not return them. Kept until the server lists them.
     let pending: Rc<RefCell<Vec<Value>>> = Default::default();
     // Lets row buttons re-render the list (render refers to itself through this cell).
     let render_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Default::default();
-    // Unread tracking: chat -> last message id opened here; chats with new messages this session.
-    let read_local: Rc<RefCell<HashMap<String, String>>> = Default::default();
-    let fresh: Rc<RefCell<HashSet<String>>> = Default::default();
 
     let render: Rc<dyn Fn()> = {
         let msgs_r = msgs.clone();
