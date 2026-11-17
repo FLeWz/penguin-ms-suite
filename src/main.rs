@@ -1,5 +1,6 @@
 mod auth;
 mod graph;
+mod msgcache;
 mod pages;
 mod relay;
 mod util;
@@ -196,6 +197,7 @@ fn tune_malloc() {}
 
 fn main() -> gtk::glib::ExitCode {
     tune_malloc();
+    std::thread::spawn(msgcache::trim);
     // Cairo renderer: ~3x lower RSS than GL/Vulkan for this list/text UI.
     // Respect an explicit user choice.
     if std::env::var_os("GSK_RENDERER").is_none() {

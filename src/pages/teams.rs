@@ -955,7 +955,7 @@ pub fn build() -> Page {
                     let mut all: Vec<Value> = vec![];
                     let mut last_next: Option<String> = None;
                     for _ in 0..40 {
-                        let v = graph::get(&path)?;
+                        let v = crate::msgcache::get(&path)?;
                         all.extend(v["value"].as_array().cloned().unwrap_or_default());
                         last_next = v["@odata.nextLink"].as_str().map(String::from);
                         let found = want.as_ref().is_none_or(|w| all.iter().any(|m| m["id"].as_str() == Some(w)));
@@ -1238,7 +1238,7 @@ pub fn build() -> Page {
             let path = next.strip_prefix(graph::BASE).unwrap_or(&next).to_string();
             let (older, load_msgs, prepend, adj) = (older.clone(), load_msgs.clone(), prepend.clone(), adj.clone());
             util::run(
-                move || graph::get(&path),
+                move || crate::msgcache::get(&path),
                 move |r| {
                     let mut o = older.borrow_mut();
                     if o.chat != cid {
@@ -1928,7 +1928,7 @@ pub fn build() -> Page {
             );
             let path = format!("/me/chats/{cid}/messages?$top=3");
             util::run(
-                move || graph::get(&path),
+                move || crate::msgcache::get(&path),
                 move |r| {
                     chat_busy.set(false);
                     let v = match r {

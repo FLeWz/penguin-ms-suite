@@ -432,7 +432,7 @@ pub fn build(h: Hooks) -> Finder {
                     for (id, title) in mine {
                         let mut path = format!("/me/chats/{id}/messages?$top=50");
                         for n in 0..pages {
-                            match graph::get(&path) {
+                            match crate::msgcache::get(&path) {
                                 Ok(v) => {
                                     let msgs = parse(&id, &title, v["value"].as_array().map_or(&[][..], |a| a.as_slice()));
                                     let next = v["@odata.nextLink"].as_str().map(|u| u.strip_prefix(graph::BASE).unwrap_or(u).to_string());
