@@ -313,6 +313,58 @@ pub(crate) fn decode_scaled(bytes: &[u8], maxw: i32, maxh: i32) -> Option<gdk::T
     Some(gdk::MemoryTexture::new(pb.width(), pb.height(), format, &pb.read_pixel_bytes(), pb.rowstride() as usize).upcast())
 }
 
+const MAX_GIF_BYTES: u64 = 6 * 1024 * 1024; // bigger files stay a still frame (all frames are decoded)
+
+fn is_gif(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 6];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok()
+        && (&head == b"GIF89a" || &head == b"GIF87a")
+        && std::fs::metadata(path).is_ok_and(|m| m.len() <= MAX_GIF_BYTES)
+}
+
+/// Play an animated GIF in `pic`, frames scaled to `w` x `h`. Only advances while the picture
+/// is inside the message viewport and the window is active; stops when the picture is gone.
+pub(crate) fn animate_gif(pic: &gtk::Picture, path: PathBuf, size: Option<(i32, i32)>) {
+    let Ok(anim) = gtk::gdk_pixbuf::PixbufAnimation::from_file(&path) else { return };
+    if anim.is_static_image() {
+        return;
+    }
+    let iter = anim.iter(None);
+    let weak = pic.downgrade();
+    glib::spawn_future_local(async move {
+        let _keep = &anim; // the iterator reads frames from the animation
+        loop {
+            let Some(pic) = weak.upgrade() else { break };
+            let on_screen = pic.is_mapped()
+                && pic.root().and_downcast::<gtk::Window>().is_some_and(|w| w.is_active())
+                && pic
+                    .ancestor(gtk::ScrolledWindow::static_type())
+                    .and_downcast::<gtk::ScrolledWindow>()
+                    .and_then(|sw| pic.compute_bounds(&sw).map(|b| (b, sw.height() as f32)))
+                    .is_some_and(|(b, vh)| b.y() + b.height() > 0.0 && b.y() < vh);
+            if !on_screen {
+                drop(pic);
+                glib::timeout_future(std::time::Duration::from_millis(300)).await;
+                continue;
+            }
+            if iter.advance(std::time::SystemTime::now()) {
+                let frame = iter.pixbuf();
+                let frame = match size {
+                    Some((w, h)) => frame.scale_simple(w, h, gtk::gdk_pixbuf::InterpType::Bilinear),
+                    None => Some(frame),
+                };
+                if let Some(f) = frame {
+                    pic.set_paintable(Some(&gdk::Texture::for_pixbuf(&f)));
+                }
+            }
+            let delay = iter.delay_time().unwrap_or(std::time::Duration::from_millis(100));
+            drop(pic);
+            glib::timeout_future(delay.max(std::time::Duration::from_millis(30))).await;
+        }
+    });
+}
+
 fn open_external(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
@@ -673,6 +725,9 @@ fn show_image(holder: &gtk::Box, tex: &gdk::Texture, name: &str, full: &std::pat
     pic.set_cursor_from_name(Some("pointer"));
     pic.set_tooltip_text(Some(name));
     pic.add_css_class("thumb");
+    if is_gif(full) {
+        animate_gif(&pic, full.to_path_buf(), Some((tex.width(), tex.height())));
+    }
     if fade {
         pic.set_opacity(0.0);
         let p = pic.clone();
@@ -710,21 +765,31 @@ fn viewer(parent: Option<&gtk::Window>, title: &str) -> gtk::Window {
 /// cache file (off the UI thread) and show that; fall back to the thumbnail.
 fn open_image(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str, full: &std::path::Path) {
     if !full.exists() {
-        return show_viewer(parent, tex, name);
+        show_viewer(parent, tex, name);
+        return;
     }
     let (parent, tex, name, path) = (parent.cloned(), tex.clone(), name.to_string(), full.to_path_buf());
+    let gif_path = path.clone();
     util::run(
         move || gdk::Texture::from_filename(&path).ok().map(SendTexture),
         move |r| match r {
-            Some(SendTexture(full)) => show_viewer(parent.as_ref(), &full, &name),
-            None => show_viewer(parent.as_ref(), &tex, &name),
+            Some(SendTexture(full_tex)) => {
+                let img = show_viewer(parent.as_ref(), &full_tex, &name);
+                if let (Some(img), true) = (img, is_gif(&gif_path)) {
+                    animate_gif(&img, gif_path, None);
+                }
+            }
+            None => {
+                show_viewer(parent.as_ref(), &tex, &name);
+            }
         },
     );
 }
 
-fn show_viewer(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str) {
-    if super::lightbox::show_image(tex, name) {
-        return;
+/// Returns the in-app viewer's picture (for animation); None for the fallback window.
+fn show_viewer(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str) -> Option<gtk::Picture> {
+    if let Some(img) = super::lightbox::show_image(tex, name) {
+        return Some(img);
     }
     let w = viewer(parent, name);
     let pic = gtk::Picture::for_paintable(tex);
@@ -736,6 +801,7 @@ fn show_viewer(parent: Option<&gtk::Window>, tex: &gdk::Texture, name: &str) {
     pic.add_controller(click);
     w.set_child(Some(&pic));
     w.present();
+    Some(pic)
 }
 
 fn open_video(parent: Option<&gtk::Window>, path: &std::path::Path, name: &str) {

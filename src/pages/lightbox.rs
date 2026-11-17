@@ -17,12 +17,13 @@ pub fn set_host(o: &gtk::Overlay) {
     HOST.with(|h| *h.borrow_mut() = Some(o.clone()));
 }
 
-/// Show `tex` in the viewer. False when no host exists (caller falls back to a window).
-pub fn show_image(tex: &gdk::Texture, name: &str) -> bool {
-    let Some(host) = HOST.with(|h| h.borrow().clone()) else { return false };
+/// Show `tex` in the viewer and return its picture (to animate). None when there is no host
+/// (the caller falls back to a window).
+pub fn show_image(tex: &gdk::Texture, name: &str) -> Option<gtk::Picture> {
+    let Some(host) = HOST.with(|h| h.borrow().clone()) else { return None };
     let (tw, th) = (tex.width() as f64, tex.height() as f64);
     if tw < 1.0 || th < 1.0 {
-        return false;
+        return None;
     }
 
     let backdrop = gtk::Overlay::new();
@@ -275,5 +276,5 @@ pub fn show_image(tex: &gdk::Texture, name: &str) -> bool {
 
     host.add_overlay(&backdrop);
     backdrop.grab_focus();
-    true
+    Some(img)
 }
