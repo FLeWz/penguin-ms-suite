@@ -51,10 +51,17 @@ const POLL_FOCUSED: Duration = Duration::from_secs(5); // Teams visible and wind
 const POLL_ACTIVE_CHAT: Duration = Duration::from_secs(2); // open chat: newest messages only
 const POLL_SAFETY_NET: Duration = Duration::from_secs(60); // chat list while the relay is healthy
 
+thread_local! {
+    /// Chat id of the favourite being dragged (set by the drag source, read by the drop target).
+    static DRAGGED: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 /// Local (per-machine) chat preferences, stored in the app config dir.
 #[derive(Default)]
 struct Prefs {
     fav: HashSet<String>,
+    /// Manual order of the favourites; favourites not listed come after, in list order.
+    fav_order: Vec<String>,
     hidden: HashSet<String>,
     /// Deleted chats -> id of their last message at that time. They stay out of the list until
     /// a newer message arrives. Kept locally because the chat list API still returns them.
@@ -83,10 +90,19 @@ impl Prefs {
             .flatten()
             .filter_map(|(k, x)| x.as_str().map(|x| (k.clone(), x.to_string())))
             .collect();
-        Prefs { fav: set("favourites"), hidden: set("hidden"), deleted }
+        let fav_order = v["favouriteOrder"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
+        Prefs { fav: set("favourites"), fav_order, hidden: set("hidden"), deleted }
     }
     fn save(&self) {
-        let v = json!({"favourites": self.fav, "hidden": self.hidden, "deleted": self.deleted});
+        let v = json!({
+            "favourites": self.fav, "favouriteOrder": self.fav_order,
+            "hidden": self.hidden, "deleted": self.deleted,
+        });
         let _ = std::fs::create_dir_all(crate::auth::dir());
         let _ = std::fs::write(Self::path(), v.to_string());
     }
@@ -207,6 +223,8 @@ fn menu_popover(
     on_hide: Rc<dyn Fn()>,
     on_delete: Rc<dyn Fn()>,
     is_deleted: bool,
+    move_up: Option<Rc<dyn Fn()>>,
+    move_down: Option<Rc<dyn Fn()>>,
 ) -> gtk::Popover {
     let pop = gtk::Popover::new();
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -228,6 +246,12 @@ fn menu_popover(
         col.append(&item("Restore chat", on_delete));
     } else {
         col.append(&item(if is_fav { "Remove from favourites" } else { "Add to favourites" }, on_fav));
+        if let Some(cb) = move_up {
+            col.append(&item("Move up", cb));
+        }
+        if let Some(cb) = move_down {
+            col.append(&item("Move down", cb));
+        }
         col.append(&item(if is_hidden { "Unhide chat" } else { "Hide chat" }, on_hide));
         col.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         col.append(&item("Delete chat…", on_delete));
@@ -1430,8 +1454,30 @@ pub fn build() -> Page {
             let one = |c: &Value| c["chatType"].as_str() == Some("oneOnOne");
             let id_of = |c: &Value| c["id"].as_str().unwrap_or("").to_string();
             let vis = |c: &&Value| !p.hidden.contains(&id_of(c));
+            let mut favs: Vec<&Value> = items.iter().filter(vis).filter(|c| p.fav.contains(&id_of(c))).collect();
+            favs.sort_by_key(|c| p.fav_order.iter().position(|o| *o == id_of(c)).unwrap_or(usize::MAX));
+            let fav_ids: Rc<Vec<String>> = Rc::new(favs.iter().map(|c| id_of(c)).collect());
+            // Store a new order of the shown favourites and redraw.
+            let apply_order: Rc<dyn Fn(Vec<String>)> = {
+                let (prefs, render_cell) = (prefs.clone(), render_cell.clone());
+                Rc::new(move |mut ord: Vec<String>| {
+                    {
+                        let mut p = prefs.borrow_mut();
+                        // Keep the place of favourites that are currently hidden.
+                        let rest: Vec<String> = p.fav_order.iter().filter(|o| !ord.contains(o)).cloned().collect();
+                        ord.extend(rest);
+                        p.fav_order = ord;
+                        p.save();
+                    }
+                    let r = render_cell.borrow().clone();
+                    if let Some(r) = r {
+                        // Defer: the drop target lives in a row that render() destroys.
+                        gtk::glib::idle_add_local_once(move || r());
+                    }
+                })
+            };
             let sections: Vec<(&str, Vec<&Value>)> = vec![
-                ("FAVOURITES", items.iter().filter(vis).filter(|c| p.fav.contains(&id_of(c))).collect()),
+                ("FAVOURITES", favs),
                 ("GROUPS", items.iter().filter(vis).filter(|c| !p.fav.contains(&id_of(c)) && !one(c)).collect()),
                 ("PEOPLE", items.iter().filter(vis).filter(|c| !p.fav.contains(&id_of(c)) && one(c)).collect()),
                 (
@@ -1486,6 +1532,9 @@ pub fn build() -> Page {
                                 let mut p = prefs.borrow_mut();
                                 if fav {
                                     Prefs::toggle(&mut p.fav, &cid);
+                                    if !p.fav.contains(&cid) {
+                                        p.fav_order.retain(|o| *o != cid);
+                                    }
                                 } else {
                                     Prefs::toggle(&mut p.hidden, &cid);
                                 }
@@ -1581,10 +1630,83 @@ pub fn build() -> Page {
                     let (t1, t2) = (toggle.clone(), toggle);
                     let fav_cb: Rc<dyn Fn()> = Rc::new(move || t1(true));
                     let hide_cb: Rc<dyn Fn()> = Rc::new(move || t2(false));
-                    let menu = chat_menu(&menu_popover(is_fav, is_hidden, fav_cb.clone(), hide_cb.clone(), on_delete.clone(), is_deleted));
+                    // Favourites can be reordered: swap with the neighbour in the shown order.
+                    let (mut move_up, mut move_down): (Option<Rc<dyn Fn()>>, Option<Rc<dyn Fn()>>) = (None, None);
+                    if label == "FAVOURITES" {
+                        let pos = fav_ids.iter().position(|f| *f == cid).unwrap_or(0);
+                        let mover = |delta: isize| -> Rc<dyn Fn()> {
+                            let (apply_order, fav_ids) = (apply_order.clone(), fav_ids.clone());
+                            Rc::new(move || {
+                                let mut ord: Vec<String> = (*fav_ids).clone();
+                                let to = pos as isize + delta;
+                                if to < 0 || to as usize >= ord.len() {
+                                    return;
+                                }
+                                ord.swap(pos, to as usize);
+                                apply_order(ord);
+                            })
+                        };
+                        // Drag a favourite onto another one: it takes that place.
+                        let src = gtk::DragSource::new();
+                        src.set_actions(gtk::gdk::DragAction::MOVE);
+                        // Drag icon: the row itself, held where it was grabbed (not the raw id).
+                        let grab = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+                        {
+                            let (cid, grab) = (cid.clone(), grab.clone());
+                            src.connect_prepare(move |_, x, y| {
+                                grab.set((x, y));
+                                // The chat id travels in DRAGGED; the payload is a plain flag so
+                                // no text (the id) is offered to the drag icon or other apps.
+                                DRAGGED.with(|d| *d.borrow_mut() = Some(cid.clone()));
+                                Some(gtk::gdk::ContentProvider::for_value(&true.to_value()))
+                            });
+                            src.connect_drag_end(|_, _, _| DRAGGED.with(|d| *d.borrow_mut() = None));
+                        }
+                        {
+                            let line_w = line.downgrade();
+                            src.connect_drag_begin(move |s, _| {
+                                if let Some(l) = line_w.upgrade() {
+                                    let (x, y) = grab.get();
+                                    s.set_icon(Some(&gtk::WidgetPaintable::new(Some(&l))), x as i32, y as i32);
+                                }
+                            });
+                        }
+                        line.add_controller(src);
+                        let dst = gtk::DropTarget::new(bool::static_type(), gtk::gdk::DragAction::MOVE);
+                        {
+                            let (apply_order, fav_ids, cid) = (apply_order.clone(), fav_ids.clone(), cid.clone());
+                            dst.connect_drop(move |_, _, _, _| {
+                                let Some(from) = DRAGGED.with(|d| d.borrow().clone()) else { return false };
+                                let mut ord: Vec<String> = (*fav_ids).clone();
+                                let (Some(a), Some(b)) =
+                                    (ord.iter().position(|x| *x == from), ord.iter().position(|x| *x == cid))
+                                else {
+                                    return false;
+                                };
+                                if a == b {
+                                    return false;
+                                }
+                                let item = ord.remove(a);
+                                ord.insert(b, item);
+                                apply_order(ord);
+                                true
+                            });
+                        }
+                        line.add_controller(dst);
+                        if pos > 0 {
+                            move_up = Some(mover(-1));
+                        }
+                        if pos + 1 < fav_ids.len() {
+                            move_down = Some(mover(1));
+                        }
+                    }
+                    let menu = chat_menu(&menu_popover(
+                        is_fav, is_hidden, fav_cb.clone(), hide_cb.clone(), on_delete.clone(), is_deleted,
+                        move_up.clone(), move_down.clone(),
+                    ));
                     line.append(&menu);
                     // Right click: the same menu, opened at the pointer.
-                    let ctx = menu_popover(is_fav, is_hidden, fav_cb, hide_cb, on_delete, is_deleted);
+                    let ctx = menu_popover(is_fav, is_hidden, fav_cb, hide_cb, on_delete, is_deleted, move_up, move_down);
                     ctx.set_parent(&line);
                     ctx.set_has_arrow(false);
                     ctx.set_halign(gtk::Align::Start);
