@@ -1676,6 +1676,15 @@ pub fn build() -> Page {
                     // New-message detection.
                     let first_load = !primed.get();
                     let mut new_in_current = false;
+                    // The open chat only counts as seen while Teams is on screen in the focused
+                    // window; otherwise (other app tab, window in background) it needs the
+                    // badge and notification like any other chat.
+                    let focused = chats
+                        .root()
+                        .and_downcast::<gtk::Window>()
+                        .map(|w| w.is_active())
+                        .unwrap_or(false);
+                    let watching = focused && chats.is_mapped();
                     for c in &items {
                         let cid = c["id"].as_str().unwrap_or("");
                         let mid = c["lastMessagePreview"]["id"].as_str().unwrap_or("");
@@ -1693,18 +1702,13 @@ pub fn build() -> Page {
                         }
                         let is_current = current.borrow().as_deref() == Some(cid);
                         new_in_current |= is_current;
-                        if !is_current {
+                        if !(is_current && watching) {
                             fresh.borrow_mut().insert(cid.to_string());
                         }
                         if prefs.borrow().hidden.contains(cid) {
                             continue; // hidden chats stay silent
                         }
-                        let focused = chats
-                            .root()
-                            .and_downcast::<gtk::Window>()
-                            .map(|w| w.is_active())
-                            .unwrap_or(false);
-                        if !(is_current && focused) {
+                        if !(is_current && watching) {
                             let n = gtk::gio::Notification::new(&chat_title(c, &my_id));
                             let who = from["displayName"].as_str().unwrap_or("");
                             let text = util::strip_html(
