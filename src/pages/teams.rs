@@ -739,27 +739,25 @@ pub fn build() -> Page {
                 }
             });
         }
-        // The scroll position is applied from an idle callback, never inside the adjustment's
-        // `changed` signal: that signal fires while the viewport is allocating, so a value set
-        // there updates the adjustment but the viewport keeps drawing the stale offset until
-        // something else triggers a layout (the "latest message hidden until I scroll" bug).
+        // The scroll position is never set inside the adjustment's `changed` signal: that
+        // signal fires while the viewport is allocating, so a value set there updates the
+        // adjustment but the viewport keeps drawing the stale offset until something else
+        // triggers a layout (the "latest message hidden until I scroll" bug). It is set right
+        // after the frame clock's layout phase instead: the value change queues another
+        // allocation, which the frame clock runs in the same frame (it repeats the layout phase
+        // while layout is requested), so the corrected position is what gets painted. An idle
+        // callback ran after the paint and showed one frame at the old offset on every load.
         let pending = Rc::new(Cell::new(false));
-        msg_scroll.vadjustment().connect_changed(move |a| {
-            if pending.replace(true) {
-                return; // one deferred update covers any number of size changes
-            }
-            let (a, pending, stick, jump, rows, msgs, hold, programmatic) = (
-                a.clone(), pending.clone(), stick.clone(), jump.clone(), rows.clone(),
+        let correct: Rc<dyn Fn()> = {
+            let (a, stick, jump, rows, msgs, hold, programmatic) = (
+                msg_scroll.vadjustment(), stick.clone(), jump.clone(), rows.clone(),
                 msgs.clone(), hold.clone(), programmatic.clone(),
             );
             let prepend = prepend_c.clone();
             let anchor = anchor_c.clone();
             let (last_input, force) = (last_input.clone(), force_restore.clone());
             let seen = seen.clone();
-            // Above redraw priority: the correction lands before the next frame, so a kinetic
-            // scroll tick never sees (and records an anchor in) the shifted layout.
-            gtk::glib::idle_add_local_full(gtk::glib::Priority::HIGH_IDLE, move || {
-                pending.set(false);
+            Rc::new(move || {
                 seen.set((a.upper(), a.page_size())); // the new size is layout, not scrolling
                 let target = jump.borrow().clone();
                 if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
@@ -797,8 +795,51 @@ pub fn build() -> Page {
                     a.set_value(a.upper() - a.page_size());
                     programmatic.set(false);
                 }
-                gtk::glib::ControlFlow::Break
+            })
+        };
+        // After-handler on the frame clock's layout signal (the window allocates in a normal
+        // handler), reconnected when the widget moves to another frame clock.
+        let hook: Rc<RefCell<Option<(gtk::gdk::FrameClock, gtk::glib::SignalHandlerId)>>> = Default::default();
+        {
+            let (pending, correct, hook) = (pending.clone(), correct.clone(), hook.clone());
+            msg_scroll.connect_realize(move |w| {
+                let Some(clock) = w.frame_clock() else { return };
+                let (pending, correct) = (pending.clone(), correct.clone());
+                let id = clock.connect_local("layout", true, move |_| {
+                    if pending.replace(false) {
+                        correct();
+                    }
+                    None
+                });
+                if let Some((c, old)) = hook.replace(Some((clock, id))) {
+                    c.disconnect(old);
+                }
             });
+        }
+        {
+            let hook = hook.clone();
+            msg_scroll.connect_unrealize(move |_| {
+                if let Some((c, id)) = hook.take() {
+                    c.disconnect(id);
+                }
+            });
+        }
+        let scroll_c = msg_scroll.clone();
+        msg_scroll.vadjustment().connect_changed(move |_| {
+            pending.set(true); // one correction covers any number of size changes
+            match scroll_c.frame_clock() {
+                // Usually already inside the layout phase; otherwise (re-emitted after a
+                // wait) this schedules one.
+                Some(c) => c.request_phase(gtk::gdk::FrameClockPhase::LAYOUT),
+                None => {
+                    let (pending, correct) = (pending.clone(), correct.clone());
+                    gtk::glib::idle_add_local_once(move || {
+                        if pending.replace(false) {
+                            correct();
+                        }
+                    });
+                }
+            }
         });
     }
     let apply_jump: Rc<dyn Fn()> = {
@@ -874,9 +915,11 @@ pub fn build() -> Page {
     jump_rev.set_margin_bottom(12);
     {
         let adj = msg_scroll.vadjustment();
-        let rev = jump_rev.clone();
+        let (rev, stick) = (jump_rev.clone(), stick.clone());
+        // Not while following: content grows before the view is pinned again, which would
+        // flash the button on every new message or image.
         let update = move |a: &gtk::Adjustment| {
-            rev.set_reveal_child(a.upper() - a.page_size() - a.value() > 200.0);
+            rev.set_reveal_child(!stick.get() && a.upper() - a.page_size() - a.value() > 200.0);
         };
         adj.connect_value_changed(update.clone());
         adj.connect_changed(update);
