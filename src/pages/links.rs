@@ -395,7 +395,10 @@ impl Links {
                                     if let (Some(src), Some(super::media::SendTexture(t))) = (p.image.clone(), img) {
                                         let mut c = me.textures.borrow_mut();
                                         if c.len() >= MAX_TEXTURES {
-                                            c.clear();
+                                            // Evict one: clearing all made cards on screen reload.
+                                            if let Some(k) = c.keys().next().cloned() {
+                                                c.remove(&k);
+                                            }
                                         }
                                         c.insert(src, t);
                                     }

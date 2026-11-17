@@ -463,6 +463,10 @@ impl Media {
         util::run(
             // Fetch and decode off the UI thread so big photos do not stall scrolling.
             move || {
+                // Already downloaded (it was shown before): decode from disk, no request.
+                if let Some(t) = file.exists().then(|| decode_thumb(&file)).flatten() {
+                    return Ok(SendTexture(t));
+                }
                 let bytes = graph::get_bytes(&path, MAX_IMAGE_BYTES)?;
                 // Keep the original on disk (for the viewer) and decode only a thumbnail.
                 let on_disk = std::fs::create_dir_all(file.parent().unwrap_or(&file)).is_ok()
@@ -484,8 +488,12 @@ impl Media {
                 match r {
                     Ok(SendTexture(t)) => {
                         let mut c = me.textures.borrow_mut();
+                        // Evict one, not all: clearing made every image on screen load again
+                        // (placeholder, then image) the next time its row was built.
                         if c.len() >= MAX_TEXTURES {
-                            c.clear();
+                            if let Some(k) = c.keys().next().cloned() {
+                                c.remove(&k);
+                            }
                         }
                         c.insert(key.clone(), t.clone());
                         drop(c);

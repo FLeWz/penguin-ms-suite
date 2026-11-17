@@ -440,6 +440,9 @@ struct Drawn {
     more: Option<gtk::Widget>,
     /// Reaction fingerprint and handle per row, same order as `ids`.
     rx: Vec<(u64, Rc<reactions::Reactor>)>,
+    /// List rows, same order as `ids`. Kept across reloads; an edited message only gets a
+    /// new bubble inside its row.
+    rows: Vec<gtk::ListBoxRow>,
 }
 
 /// Scroll anchor: the first message row in view and its distance from the viewport top.
@@ -674,10 +677,11 @@ pub fn build() -> Page {
     // Follow mode: while set, the view stays pinned to the newest message every time the
     // content or viewport size changes (wrapped labels and the final viewport height settle
     // over several layout passes, so a timed pin can land short). It turns off when the user
-    // scrolls up and back on when they return to the bottom. `settling` ignores the scroll
-    // changes caused by rebuilding the list.
+    // scrolls up and back on when they return to the bottom.
     let stick = Rc::new(Cell::new(true));
-    let settling = Rc::new(Cell::new(false));
+    // (upper, page size) as of the last layout: a value change that comes with a different
+    // size is GTK clamping or re-laying out the list, not the user scrolling.
+    let seen: Rc<Cell<(f64, f64)>> = Default::default();
     // Message id to bring into view after loading (from the finder), and the rows by id.
     let jump: Rc<RefCell<Option<String>>> = Default::default();
     let rows: Rc<RefCell<HashMap<String, gtk::Widget>>> = Default::default();
@@ -707,23 +711,23 @@ pub fn build() -> Page {
         let (last_input, force_restore) = (last_input.clone(), force_restore.clone());
         let programmatic = programmatic.clone();
         {
-            let (stick, settling, programmatic) = (stick.clone(), settling.clone(), programmatic.clone());
+            let (stick, programmatic, seen) = (stick.clone(), programmatic.clone(), seen.clone());
             let more_cell = more_cell.clone();
             let (anchor, frozen, msgs) = (anchor.clone(), anchor_frozen.clone(), msgs.clone());
-            let programmatic2 = programmatic.clone();
-            let older_v = older.clone();
             let last_input = last_input.clone();
             msg_scroll.vadjustment().connect_value_changed(move |a| {
-                if !programmatic2.get() {
-                    last_input.set(Instant::now());
+                // Only real scrolling moves the anchor or changes follow mode. Rows added,
+                // removed or resized change the size too; those are corrected separately.
+                let size = (a.upper(), a.page_size());
+                let user = !programmatic.get() && seen.replace(size) == size;
+                if !user {
+                    return;
                 }
-                // While an older page is on its way the anchor stays the message that was in
-                // view when the request was made.
-                let loading = older_v.try_borrow().map(|o| o.loading).unwrap_or(false);
-                if !programmatic2.get() && !frozen.get() && !loading {
+                last_input.set(Instant::now());
+                if !frozen.get() {
                     record_anchor(&msgs, a, &anchor);
                 }
-                if !programmatic.get() && !settling.get() {
+                {
                     stick.set(a.upper() - a.page_size() - a.value() < 24.0);
                     // Near the top while reading history: fetch the next older page.
                     if !stick.get() && a.value() < 300.0 {
@@ -751,8 +755,12 @@ pub fn build() -> Page {
             let prepend = prepend_c.clone();
             let anchor = anchor_c.clone();
             let (last_input, force) = (last_input.clone(), force_restore.clone());
-            gtk::glib::idle_add_local_once(move || {
+            let seen = seen.clone();
+            // Above redraw priority: the correction lands before the next frame, so a kinetic
+            // scroll tick never sees (and records an anchor in) the shifted layout.
+            gtk::glib::idle_add_local_full(gtk::glib::Priority::HIGH_IDLE, move || {
                 pending.set(false);
+                seen.set((a.upper(), a.page_size())); // the new size is layout, not scrolling
                 let target = jump.borrow().clone();
                 if let Some(w) = target.and_then(|id| rows.borrow().get(&id).cloned()) {
                     scroll_to(&msgs, &a, &w); // keep it in view while labels settle
@@ -789,6 +797,7 @@ pub fn build() -> Page {
                     a.set_value(a.upper() - a.page_size());
                     programmatic.set(false);
                 }
+                gtk::glib::ControlFlow::Break
             });
         });
     }
@@ -968,7 +977,6 @@ pub fn build() -> Page {
         );
         let (live_last, hold, shown, adj) =
             (live_last.clone(), hold.clone(), shown.clone(), msg_scroll.vadjustment());
-        let settling_c = settling.clone();
         let me = me.clone();
         let media_c = media.clone();
         let links_c = link_previews.clone();
@@ -1007,7 +1015,6 @@ pub fn build() -> Page {
             );
             let (live_last, hold, shown, adj) =
                 (live_last.clone(), hold.clone(), shown.clone(), adj.clone());
-            let settling = settling_c.clone();
             let my_id = me.borrow().clone();
             let media = media_c.clone();
             let link_previews = links_c.clone();
@@ -1042,15 +1049,9 @@ pub fn build() -> Page {
                     if current.borrow().as_deref() != Some(cid.as_str()) {
                         return; // user switched chats meanwhile
                     }
-                    // Follow new messages only if the user is at the bottom or just opened this chat;
-                    // otherwise keep the reading position.
+                    // Follow new messages only if the view is at the bottom (follow mode) or the
+                    // chat was just opened; otherwise keep the reading position.
                     let switched = shown.borrow().as_deref() != Some(cid.as_str());
-                    let at_bottom = adj.upper() - adj.page_size() - adj.value() < 40.0;
-                    settling.set(true);
-                    gtk::glib::timeout_add_local_once(Duration::from_millis(600), {
-                        let settling = settling.clone();
-                        move || settling.set(false)
-                    });
                     // Older pages: a new chat (or a jump that paged back itself) starts over from
                     // this response; otherwise keep what was already fetched.
                     {
@@ -1089,7 +1090,7 @@ pub fn build() -> Page {
                         stick.set(false); // reading older history; position restored by the handler
                     } else if jump.borrow().is_some() {
                         stick.set(false); // the jump positions the view
-                    } else if switched || stick.get() || at_bottom {
+                    } else if switched || stick.get() {
                         stick.set(true);
                     } else {
                         stick.set(false);
@@ -1114,11 +1115,13 @@ pub fn build() -> Page {
                     finder::add(&index, finder::parse(&cid, &title, &items));
                     // The API orders by last-modified (edited messages jump ahead), so sort by
                     // creation time, oldest first, for display.
+                    // Ties broken by id so reloads keep a stable order (rows are reused by order).
                     items.sort_by(|a, b| {
-                        a["createdDateTime"].as_str().unwrap_or("").cmp(b["createdDateTime"].as_str().unwrap_or(""))
+                        let (ca, cb) = (a["createdDateTime"].as_str().unwrap_or(""), b["createdDateTime"].as_str().unwrap_or(""));
+                        ca.cmp(cb).then_with(|| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")))
                     });
                     // (id, content signature, text, message) of every row to show.
-                    let entries: Vec<(String, u64, String, Value)> = items
+                    let mut entries: Vec<(String, u64, String, Value)> = items
                         .into_iter()
                         .filter_map(|m| {
                             let text = util::message_text(
@@ -1130,9 +1133,11 @@ pub fn build() -> Page {
                             }
                             use std::hash::{Hash, Hasher};
                             let mut h = std::collections::hash_map::DefaultHasher::new();
-                            m["lastModifiedDateTime"].as_str().hash(&mut h);
+                            // Not lastModifiedDateTime: a reaction bumps it too, and reactions are
+                            // refreshed in place without rebuilding the bubble (and its images).
                             m["deletedDateTime"].as_str().hash(&mut h);
                             m["body"]["content"].as_str().hash(&mut h);
+                            m["attachments"].to_string().hash(&mut h);
                             Some((m["id"].as_str().unwrap_or("").to_string(), h.finish(), text, m))
                         })
                         .collect();
@@ -1153,6 +1158,10 @@ pub fn build() -> Page {
                                 })
                                 .map(|e| e.0.clone())
                         });
+                    // The row carrying the line looks different: part of its signature.
+                    if let Some(e) = entries.iter_mut().find(|e| Some(&e.0) == first_unread.as_ref()) {
+                        e.1 = !e.1;
+                    }
                     let make_row = |text: &str, m: &Value| -> (gtk::Box, String, (u64, Rc<reactions::Reactor>)) {
                         let who = m["from"]["user"]["displayName"].as_str().unwrap_or("system");
                         let media_widgets = media.widgets(m);
@@ -1209,75 +1218,105 @@ pub fn build() -> Page {
                         more.upcast()
                     };
 
-                    // Incremental update when everything already shown is unchanged and sits as one
-                    // run inside the new list: add only the rows before and after it.
-                    let split = {
+                    // Incremental update: rows of messages still listed are kept (an edited one
+                    // only gets a new bubble inside its row), new ones are inserted, vanished ones
+                    // removed. The list is never cleared, so the scroll anchor stays valid and
+                    // loaded images are not reloaded. Needs the kept messages in the same order.
+                    let reuse = {
                         let d = drawn.borrow();
-                        let n = d.ids.len();
                         let ok = d.chat == cid
-                            && n > 0
+                            && !d.ids.is_empty()
                             && jump.borrow().is_none()
-                            && msgs.first_child().is_some() // the list may have been cleared
-                            && d.ids.iter().all(|i| !i.is_empty());
-                        ok.then(|| entries.iter().position(|e| e.0 == d.ids[0]))
-                            .flatten()
-                            .filter(|k| {
-                                k + n <= entries.len()
-                                    && (0..n).all(|i| entries[k + i].0 == d.ids[i] && entries[k + i].1 == d.sigs[i])
-                            })
+                            && d.rows.len() == d.ids.len()
+                            && d.rx.len() == d.ids.len()
+                            && sel.borrow().items.len() == d.ids.len()
+                            && d.rows.iter().all(|r| r.parent().is_some()) // the list may have been cleared
+                            && d.ids.iter().chain(entries.iter().map(|e| &e.0)).all(|i| !i.is_empty());
+                        ok && {
+                            let new_ids: HashSet<&str> = entries.iter().map(|e| e.0.as_str()).collect();
+                            let old_ids: HashSet<&str> = d.ids.iter().map(String::as_str).collect();
+                            let a: Vec<&str> = d.ids.iter().map(String::as_str).filter(|i| new_ids.contains(i)).collect();
+                            let b: Vec<&str> =
+                                entries.iter().map(|e| e.0.as_str()).filter(|i| old_ids.contains(i)).collect();
+                            new_ids.len() == entries.len() && !a.is_empty() && a == b
+                        }
                     };
-                    if let Some(k) = split {
-                        let n = drawn.borrow().ids.len();
-                        let had_more = drawn.borrow().more.clone();
-                        let mut more_now = had_more.clone();
-                        if want_more != had_more.is_some() || k > 0 {
-                            if let Some(w) = had_more.as_ref().and_then(|w| w.parent()) {
+                    if reuse {
+                        let old = std::mem::take(&mut *drawn.borrow_mut());
+                        let old_items = std::mem::take(&mut sel.borrow_mut().items);
+                        let mut more_now = old.more.clone();
+                        if want_more != more_now.is_some() {
+                            if let Some(w) = more_now.take().and_then(|w| w.parent()) {
                                 msgs.remove(&w);
                             }
-                            more_now = None;
-                        }
-                        let base = more_now.is_some() as i32;
-                        // Rows kept as they are: only refresh reactions that changed.
-                        let mut rx: Vec<(u64, Rc<reactions::Reactor>)> = vec![];
-                        for (i, e) in entries[..k].iter().enumerate() {
-                            let (r, copy, h) = make_row(&e.2, &e.3);
-                            msgs.insert(&r, base + i as i32);
-                            sel.borrow_mut().items.insert(i, (r.upcast(), copy));
-                            rx.push(h);
-                        }
-                        {
-                            let d = drawn.borrow();
-                            for i in 0..n {
-                                let (old_sig, reactor) = &d.rx[i];
-                                let new_sig = reactions::sig(&entries[k + i].3["reactions"]);
-                                if *old_sig != new_sig {
-                                    reactor.refresh(&entries[k + i].3["reactions"]);
-                                }
-                                rx.push((new_sig, reactor.clone()));
+                            if want_more {
+                                let w = make_more();
+                                msgs.insert(&w, 0);
+                                more_now = Some(w);
                             }
                         }
-                        if k > 0 {
+                        let base = more_now.is_some() as i32;
+                        let keep: HashSet<&str> = entries.iter().map(|e| e.0.as_str()).collect();
+                        let mut kept: HashMap<String, (gtk::ListBoxRow, u64, (u64, Rc<reactions::Reactor>), (gtk::Widget, String))> =
+                            HashMap::new();
+                        let mut moved = false; // rows added, removed or rebuilt: selection indices shift
+                        for (((id, sig), (row, rx)), item) in
+                            old.ids.into_iter().zip(old.sigs).zip(old.rows.into_iter().zip(old.rx)).zip(old_items)
+                        {
+                            if keep.contains(id.as_str()) {
+                                kept.insert(id, (row, sig, rx, item));
+                            } else {
+                                msgs.remove(&row);
+                                rows.borrow_mut().remove(&id);
+                                moved = true;
+                            }
+                        }
+                        let (mut new_rows, mut new_rx, mut new_items) = (vec![], vec![], vec![]);
+                        for (i, e) in entries.iter().enumerate() {
+                            if let Some((row, sig, (rsig, reactor), item)) = kept.remove(&e.0) {
+                                if sig != e.1 {
+                                    // Edited or deleted: new bubble in the same row.
+                                    let (r, copy, h) = make_row(&e.2, &e.3);
+                                    row.set_child(Some(&r));
+                                    new_items.push((r.upcast(), copy));
+                                    new_rx.push(h);
+                                    moved = true;
+                                } else {
+                                    let new_sig = reactions::sig(&e.3["reactions"]);
+                                    if rsig != new_sig {
+                                        reactor.refresh(&e.3["reactions"]);
+                                    }
+                                    new_items.push(item);
+                                    new_rx.push((new_sig, reactor));
+                                }
+                                new_rows.push(row);
+                            } else {
+                                let (r, copy, h) = make_row(&e.2, &e.3);
+                                msgs.insert(&r, base + i as i32);
+                                let Some(row) = r.parent().and_downcast::<gtk::ListBoxRow>() else { continue };
+                                new_items.push((r.upcast(), copy));
+                                new_rx.push(h);
+                                new_rows.push(row);
+                                moved = true;
+                            }
+                        }
+                        {
                             let mut st = sel.borrow_mut();
-                            st.anchor = None; // indices shifted
-                            st.range = None;
+                            st.items = new_items;
+                            if moved {
+                                st.anchor = None;
+                                st.range = None;
+                            }
                             st.paint();
                         }
-                        for e in &entries[k + n..] {
-                            let (r, copy, h) = make_row(&e.2, &e.3);
-                            msgs.append(&r);
-                            sel.borrow_mut().items.push((r.upcast(), copy));
-                            rx.push(h);
-                        }
-                        if more_now.is_none() && want_more {
-                            let w = make_more();
-                            msgs.insert(&w, 0);
-                            more_now = Some(w);
-                        }
-                        let mut d = drawn.borrow_mut();
-                        d.ids = entries.iter().map(|e| e.0.clone()).collect();
-                        d.sigs = entries.iter().map(|e| e.1).collect();
-                        d.more = more_now;
-                        d.rx = rx;
+                        *drawn.borrow_mut() = Drawn {
+                            chat: cid.clone(),
+                            ids: entries.iter().map(|e| e.0.clone()).collect(),
+                            sigs: entries.iter().map(|e| e.1).collect(),
+                            more: more_now,
+                            rx: new_rx,
+                            rows: new_rows,
+                        };
                     } else {
                         anchor_frozen.set(true);
                         *anchor.borrow_mut() = None;
@@ -1293,11 +1332,12 @@ pub fn build() -> Page {
                             msgs.append(&w);
                             w
                         });
-                        let mut rx = vec![];
+                        let (mut rx, mut list_rows) = (vec![], vec![]);
                         for e in &entries {
                             let (r, copy, h) = make_row(&e.2, &e.3);
                             sel.borrow_mut().items.push((r.clone().upcast(), copy));
                             msgs.append(&r);
+                            list_rows.extend(r.parent().and_downcast::<gtk::ListBoxRow>());
                             rx.push(h);
                         }
                         *drawn.borrow_mut() = Drawn {
@@ -1306,6 +1346,7 @@ pub fn build() -> Page {
                             sigs: entries.iter().map(|e| e.1).collect(),
                             more,
                             rx,
+                            rows: list_rows,
                         };
                     }
                     apply_jump();
