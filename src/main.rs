@@ -1,3 +1,4 @@
+mod appicon;
 mod auth;
 mod graph;
 mod msgcache;
@@ -204,7 +205,9 @@ fn main() -> gtk::glib::ExitCode {
         // SAFETY: single-threaded here, before GTK init or any thread spawn.
         unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
     }
+    gtk::glib::set_application_name(appicon::TITLE);
     let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| appicon::setup(APP_ID));
     app.connect_activate(build_ui);
     app.run()
 }
@@ -273,8 +276,8 @@ fn build_ui(app: &adw::Application) {
 
     // Login view.
     let login = adw::StatusPage::builder()
-        .icon_name("avatar-default-symbolic")
-        .title("Penguin MS Suite")
+        .icon_name(APP_ID)
+        .title(appicon::TITLE)
         .description("Sign in with your Microsoft 365 account")
         .build();
     let sign_in = gtk::Button::with_label("Sign in");
@@ -287,7 +290,7 @@ fn build_ui(app: &adw::Application) {
     root.add_named(&login, Some("login"));
     root.add_named(&app_view, Some("app"));
 
-    let title = adw::WindowTitle::new("Penguin MS Suite", "");
+    let title = adw::WindowTitle::new(appicon::TITLE, "");
     let show_app = {
         let (root, buttons, select, title) =
             (root.clone(), buttons.clone(), select.clone(), title.clone());
@@ -391,7 +394,7 @@ fn build_ui(app: &adw::Application) {
 
     let win = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Penguin MS Suite")
+        .title(appicon::TITLE)
         .default_width(saved_size("window_width", 1100))
         .default_height(saved_size("window_height", 720))
         .content(&toasts)
