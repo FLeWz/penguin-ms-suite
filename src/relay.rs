@@ -45,6 +45,16 @@ pub fn url() -> Option<String> {
         .filter(|u| !u.is_empty())
         .or_else(|| Some(env!("BUILTIN_PENGUIN_MS_RELAY_URL").to_string()).filter(|u| !u.is_empty()))
         .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| {
+            // Tokens and the device secret travel to the relay: HTTPS only (plain http is
+            // accepted for a relay on this machine, for testing).
+            let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"].iter().any(|l| u.starts_with(l));
+            let ok = u.starts_with("https://") || local;
+            if !ok {
+                eprintln!("relay: PENGUIN_MS_RELAY_URL must start with https://; relay disabled");
+            }
+            ok
+        })
 }
 
 /// Invite secret: `PENGUIN_MS_RELAY_INVITE`, else `relay_invite` in the config dir, else the
