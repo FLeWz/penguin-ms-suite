@@ -1769,7 +1769,7 @@ pub fn build() -> Page {
                     } else {
                         known_me
                     };
-                    let v = graph::get("/me/chats?$expand=members&$top=50&$orderby=lastMessagePreview/createdDateTime%20desc")?;
+                    let v = graph::get("/me/chats?$expand=members,lastMessagePreview&$top=50&$orderby=lastMessagePreview/createdDateTime%20desc")?;
                     Ok::<_, String>((me, v))
                 },
                 move |r| {
