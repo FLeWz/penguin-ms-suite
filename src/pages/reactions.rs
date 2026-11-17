@@ -95,6 +95,38 @@ impl Reactor {
                 });
                 strip.append(&b);
             }
+            // "+" opens the full emoji chooser, built on first use (it loads the whole emoji set).
+            let more = gtk::Button::with_label("+");
+            more.add_css_class("flat");
+            more.set_tooltip_text(Some("Any emoji"));
+            {
+                let (me, pop, anchor) = (me.clone(), pop.clone(), add.clone());
+                let chooser: Rc<RefCell<Option<gtk::EmojiChooser>>> = Default::default();
+                let chooser_c = chooser.clone();
+                more.connect_clicked(move |_| {
+                    pop.popdown();
+                    let mut slot = chooser_c.borrow_mut();
+                    let c = slot.get_or_insert_with(|| {
+                        let c = gtk::EmojiChooser::new();
+                        c.set_parent(&anchor); // anchored to the row button: the strip popover is closed now
+                        let me = me.clone();
+                        c.connect_emoji_picked(move |_, e| {
+                            // The chooser may add a skin-tone or presentation selector; strip
+                            // nothing, Teams takes the emoji as given.
+                            let have = me.mine.borrow().contains_key(e);
+                            me.toggle(e, !have);
+                        });
+                        c
+                    });
+                    c.popup();
+                });
+                add.connect_destroy(move |_| {
+                    if let Some(c) = chooser.borrow_mut().take() {
+                        c.unparent();
+                    }
+                });
+            }
+            strip.append(&more);
             pop.set_child(Some(&strip));
             add.set_popover(Some(&pop));
             row.append(&add);
