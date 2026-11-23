@@ -2034,10 +2034,26 @@ pub fn build() -> Page {
                             let text = util::strip_html(
                                 c["lastMessagePreview"]["body"]["content"].as_str().unwrap_or(""),
                             );
+                            let img = media::first_image(&c["lastMessagePreview"]);
+                            let text = if text.is_empty() && img.is_some() { "Photo".to_string() } else { text };
                             n.set_body(Some(&if who.is_empty() { text } else { format!("{who}: {text}") }));
                             n.set_default_action("app.raise");
+                            let id = format!("chat-{cid}");
                             if let Some(app) = gtk::gio::Application::default() {
-                                app.send_notification(Some(&format!("chat-{cid}")), &n);
+                                app.send_notification(Some(&id), &n);
+                            }
+                            // Resend with the picture once it is downloaded (same id replaces it).
+                            if let Some(a) = img {
+                                util::run(
+                                    move || media::fetch_to_cache(&a).ok().filter(|_| {
+                                        std::fs::metadata(&a.cache).is_ok_and(|m| m.len() <= 5 << 20)
+                                    }).map(|_| a.cache),
+                                    move |path| {
+                                        let (Some(path), Some(app)) = (path, gtk::gio::Application::default()) else { return };
+                                        n.set_icon(&gtk::gio::FileIcon::new(&gtk::gio::File::for_path(path)));
+                                        app.send_notification(Some(&id), &n);
+                                    },
+                                );
                             }
                         }
                     }

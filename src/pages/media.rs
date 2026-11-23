@@ -213,6 +213,11 @@ fn download_attachment(a: &Attachment, dest: &std::path::Path) -> Result<(), Str
     }
 }
 
+/// First image of a message (for a notification icon), if any.
+pub fn first_image(m: &Value) -> Option<Attachment> {
+    items(m).into_iter().find(|i| i.kind == Kind::Image).map(|i| i.attachment())
+}
+
 /// Download into the cache unless it is already there. Blocking: call from a worker thread.
 pub fn fetch_to_cache(a: &Attachment) -> Result<(), String> {
     if a.cache.exists() {
