@@ -1038,8 +1038,10 @@ pub fn build() -> Page {
     // Unread tracking: chat -> last message id opened here; chats with new messages this session.
     let read_local: Rc<RefCell<HashMap<String, String>>> = Default::default();
     let fresh: Rc<RefCell<HashSet<String>>> = Default::default();
-    // (chat, read marker when it was opened while unread): the "New messages" line goes above
-    // the first message newer than the marker. Taken before the chat is marked read.
+    // (chat, marker taken when the chat was opened): the "New messages" line goes above the
+    // first message from someone else newer than the marker, until the next chat switch.
+    // Marker: the server read marker if the chat was unread (taken before it is marked read),
+    // else the newest message at open, so messages arriving while it is open get the line too.
     let divider: Rc<RefCell<Option<(String, String)>>> = Default::default();
 
     let load_msgs = {
@@ -1073,8 +1075,13 @@ pub fn build() -> Page {
                     *d = items
                         .iter()
                         .find(|c| c["id"].as_str() == Some(id.as_str()))
-                        .filter(|c| is_unread(c, my, &read_l.borrow(), &fresh_l.borrow()))
-                        .and_then(|c| c["viewpoint"]["lastMessageReadDateTime"].as_str())
+                        .and_then(|c| {
+                            if is_unread(c, my, &read_l.borrow(), &fresh_l.borrow()) {
+                                c["viewpoint"]["lastMessageReadDateTime"].as_str()
+                            } else {
+                                c["lastMessagePreview"]["createdDateTime"].as_str()
+                            }
+                        })
                         .map(|m| (id.clone(), m.to_string()));
                 }
             }
