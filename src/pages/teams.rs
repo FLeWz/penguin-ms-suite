@@ -2029,6 +2029,9 @@ pub fn build() -> Page {
                         }
                         let is_current = current.borrow().as_deref() == Some(cid);
                         new_in_current |= is_current;
+                        if std::env::var_os("PENGUIN_MS_DEBUG").is_some() {
+                            eprintln!("notify: chat={cid} open={is_current} focused={focused} watching={watching}");
+                        }
                         if !(is_current && watching) {
                             fresh.borrow_mut().insert(cid.to_string());
                         }
@@ -2266,9 +2269,11 @@ pub fn build() -> Page {
             current.clone(), live_last.clone(), seen.clone(), load_msgs.clone(),
             do_refresh.clone(), chat_busy.clone(), penalty.clone(),
         );
+        let msgs_p = msgs.clone();
         Rc::new(move || {
             let Some(cid) = current.borrow().clone() else { return };
             chat_busy.set(true);
+            let msgs_w = msgs_p.clone();
             let (current, live_last, seen, load_msgs, do_refresh, chat_busy, penalty) = (
                 current.clone(), live_last.clone(), seen.clone(), load_msgs.clone(),
                 do_refresh.clone(), chat_busy.clone(), penalty.clone(),
@@ -2297,8 +2302,16 @@ pub fn build() -> Page {
                     if known.is_some() && edited && known.as_deref() == Some(newest) {
                         load_msgs();
                     } else if known.is_some_and(|k| k != newest) {
-                        // Mark seen so the list poll does not notify for the chat on screen.
-                        seen.borrow_mut().insert(cid.clone(), newest.to_string());
+                        // Mark seen so the list poll does not notify for the chat on screen, but
+                        // only if it is still on screen: focus may have moved since the request.
+                        let watching = msgs_w
+                            .root()
+                            .and_downcast::<gtk::Window>()
+                            .is_some_and(|w| w.is_active())
+                            && msgs_w.is_mapped();
+                        if watching {
+                            seen.borrow_mut().insert(cid.clone(), newest.to_string());
+                        }
                         load_msgs();
                         do_refresh(true); // refresh previews / ordering
                     }
